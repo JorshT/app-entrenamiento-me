@@ -16,8 +16,9 @@ const BASE_URL = (process.env.BASE_URL || `http://localhost:${process.env.PORT |
   const db = await openDb({ dir: process.env.DATA_DIR || path.join(__dirname, '..', 'data', 'pglite') });
   const arg = process.argv[2];
   if (arg === '--list') {
-    for (const s of await db.query('SELECT name, token, created_at FROM spaces ORDER BY id')) {
-      console.log(`${s.name}  (${s.created_at.toISOString().slice(0, 10)})\n  ${BASE_URL}/t/${s.token}`);
+    for (const s of await db.query('SELECT name, token, created_at, is_admin, disabled FROM spaces ORDER BY id')) {
+      const tags = [s.is_admin && 'administrador', s.disabled && 'suspendido'].filter(Boolean).join(', ');
+      console.log(`${s.name}  (${s.created_at.toISOString().slice(0, 10)})${tags ? `  [${tags}]` : ''}\n  ${BASE_URL}/t/${s.token}`);
     }
   } else {
     const space = await createSpace(db, { name: arg });

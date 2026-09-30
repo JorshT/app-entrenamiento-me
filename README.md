@@ -6,6 +6,14 @@ con un **enlace único que contiene un token** (`https://tu-dominio/t/<token>`).
 
 ## Qué puedes hacer
 
+- **Entrenamiento en vivo** (botón *Nueva*): empiezas sin planear nada, agregas cada
+  ejercicio cuando lo vas a hacer y confirmas cada serie (✓) al terminarla.
+  - Se propone la serie de la vez anterior como **objetivo a superar**, con botones +/− para
+    kg y reps; cada serie muestra ↑/=/↓ frente a la anterior y 🏆 cuando superas la vez pasada.
+  - Al confirmar una serie arranca el **descanso** solo.
+  - Se **guarda sola** en el servidor (si no hay conexión, se guarda en el celular y se sube
+    después). Puedes continuarla desde otro dispositivo.
+  - Al **Terminar** anotas duración (sugerida), RPE, peso corporal y comentarios.
 - **Registrar sesiones**: fecha, nombre/enfoque, duración, esfuerzo (RPE 1‑10),
   peso corporal y comentarios.
 - **Ejercicios de cada sesión**: series con repeticiones, kilos y RIR (opcional),
@@ -29,13 +37,16 @@ con un **enlace único que contiene un token** (`https://tu-dominio/t/<token>`).
 - **Ejercicios**: catálogo inicial de ~45 ejercicios con grupo muscular principal y
   secundarios; puedes crear, editar y archivar. Cada ejercicio tiene su historial y
   gráfico de progreso.
-- **Ajustes**: nombre, meta semanal, copiar enlace, **generar un enlace nuevo**
-  (invalida el anterior), respaldo e importación en JSON.
+- **Ajustes**: nombre, meta semanal, copiar enlace, respaldo e importación en JSON.
+- **Varios usuarios**: cada persona tiene su propio enlace y sus propios datos. El
+  administrador los crea y gestiona desde **Ajustes → Usuarios** (ver más abajo).
 
 ## Cómo funciona el acceso por token
 
-- Cada "espacio" de datos tiene un token aleatorio de 32 caracteres. Quien tenga el
-  enlace puede ver y editar esos datos: trátalo como una contraseña.
+- Cada usuario ("espacio" de datos) tiene un token aleatorio de 32 caracteres. Quien tenga
+  el enlace puede ver y editar esos datos: trátalo como una contraseña.
+- El **primer espacio** creado es el del **administrador** (tú). Si la base ya tenía
+  espacios, el más antiguo pasa a serlo automáticamente.
 - El navegador recuerda el enlace: después basta con abrir la dirección raíz.
   En el celular, usa "Agregar a pantalla de inicio" para tenerla como app.
 - La app envía `Referrer-Policy: no-referrer` y `noindex` para que el token no se
@@ -99,7 +110,23 @@ https://<tu-proyecto>.vercel.app/t/<ACCESS_TOKEN>
 - 500 MB de base de datos alcanzan para muchos años de entrenamientos.
 - Aun así, descarga un respaldo de vez en cuando desde **Ajustes → Descargar respaldo**.
 
-### Cambiar el enlace
+### Invitar a otras personas
+
+En tu app, **Ajustes → Usuarios**:
+
+- **+ Nuevo usuario**: escribe su nombre y obtienes su enlace. Envíaselo con **Copiar** o
+  **Compartir** (WhatsApp, correo…). Su espacio parte vacío, con el catálogo de ejercicios.
+- En cada usuario ves su actividad (sesiones totales, de esta semana y la última) y en
+  el menú **⋯** puedes:
+  - **Generar enlace nuevo**: si lo perdió o se filtró. El anterior deja de funcionar.
+  - **Suspender / reactivar** el acceso sin borrar sus datos.
+  - **Cambiar nombre** o **Eliminar** (borra al usuario y todos sus entrenamientos).
+- No abras los enlaces de otros en tu navegador: la app recordaría el de ellos en vez
+  del tuyo.
+
+Solo el administrador puede generar enlaces nuevos; los demás usuarios deben pedírtelo.
+
+### Cambiar tu enlace
 
 **Ajustes → Generar enlace nuevo** crea un token nuevo e invalida el anterior (en
 todos tus dispositivos). `ACCESS_TOKEN` solo se usa para crear tu espacio la primera
@@ -129,8 +156,8 @@ completa `DATABASE_URL` (y `ACCESS_TOKEN` si quieres).
 Otros comandos:
 
 ```bash
-npm run new-link -- "Nombre"   # crea otro espacio con su propio enlace (usa DATABASE_URL si existe)
-npm run new-link -- --list     # muestra los enlaces existentes
+npm run new-link -- "Nombre"   # crea otro usuario con su propio enlace (usa DATABASE_URL si existe)
+npm run new-link -- --list     # muestra los enlaces existentes (y quién es administrador)
 npm test                       # pruebas (PGlite; o un Postgres real con TEST_DATABASE_URL)
 ```
 

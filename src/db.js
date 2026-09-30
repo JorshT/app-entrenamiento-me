@@ -82,10 +82,12 @@ function newToken() {
 
 async function createSpace(db, { token = newToken(), name } = {}) {
   return db.tx(async (q) => {
-    const space = await q.one('INSERT INTO spaces (token, name) VALUES ($1, $2) RETURNING *', [
-      token,
-      name || 'Mis entrenamientos',
-    ]);
+    // El primer espacio que se crea es el del administrador.
+    const space = await q.one(
+      `INSERT INTO spaces (token, name, is_admin)
+       VALUES ($1, $2, NOT EXISTS (SELECT 1 FROM spaces WHERE is_admin)) RETURNING *`,
+      [token, name || 'Mis entrenamientos']
+    );
     const names = DEFAULT_EXERCISES.map((e) => e[0]);
     const muscles = DEFAULT_EXERCISES.map((e) => e[1]);
     const secondary = DEFAULT_EXERCISES.map((e) => (e[2] || []).join(','));

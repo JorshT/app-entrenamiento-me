@@ -2,7 +2,7 @@
 
 const path = require('node:path');
 const express = require('express');
-const { findSpaceByToken, newToken } = require('./db');
+const { findSpaceByToken, newToken, createSpace } = require('./db');
 const { computeStats, e1rm } = require('./stats');
 const { MUSCLES } = require('./catalog');
 const D = require('./dates');
@@ -60,6 +60,7 @@ function parseSession(body, validExerciseIds) {
     rpe: optInt(body.rpe, 1, 10, 'rpe'),
     bodyweight: optNum(body.bodyweight, 0, 500, 'bodyweight'),
     notes: str(body.notes, 4000, 'notes'),
+    in_progress: !!body.in_progress,
     exercises: exercises.map((ex, i) => {
       const exerciseId = Number(ex && ex.exercise_id);
       if (!validExerciseIds(exerciseId)) throw new HttpError(400, `Ejercicio #${i + 1} no existe`);
@@ -154,9 +155,9 @@ async function exerciseIds(q, spaceId) {
 
 async function insertSession(q, spaceId, data) {
   const { id } = await q.one(
-    `INSERT INTO sessions (space_id, date, title, duration_min, rpe, bodyweight, notes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-    [spaceId, data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes]
+    `INSERT INTO sessions (space_id, date, title, duration_min, rpe, bodyweight, notes, in_progress)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [spaceId, data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes, data.in_progress]
   );
   await writeSessionChildren(q, id, data.exercises);
   return id;
@@ -192,6 +193,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     const db = await getDb();
     const space = await findSpaceByToken(db, req.params.token);
     if (!space) return res.status(404).json({ error: 'Enlace no válido' });
+    if (space.disabled) return res.status(403).json({ error: 'Tu acceso está suspendido' });
     req.db = db;
     req.space = space;
     res.set('Cache-Control', 'no-store');
@@ -210,11 +212,83 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     res.json({ ok: true });
   });
 
-  // Genera un token nuevo e invalida el anterior (por si el enlace se filtró).
+  // Genera un token nuevo e invalida el anterior (por si el enlace se filtró). Solo el administrador.
   api.post('/s/:token/rotate', async (req, res) => {
+    if (!req.space.is_admin) throw new HttpError(403, 'Pídele un enlace nuevo al administrador');
     const token = newToken();
     await req.db.query('UPDATE spaces SET token = $1 WHERE id = $2', [token, req.space.id]);
     res.json({ token });
+  });
+
+  // --- Administración de usuarios (solo el administrador) ---
+  api.use('/s/:token/admin', (req, res, next) => {
+    if (!req.space.is_admin) throw new HttpError(403, 'Solo el administrador puede hacer esto');
+    next();
+  });
+
+  const findUser = async (req) => {
+    const id = optInt(req.params.id, 1, 2147483647, 'id');
+    const user = await req.db.one('SELECT id, is_admin FROM spaces WHERE id = $1', [id]);
+    if (!user) throw new HttpError(404, 'Usuario no encontrado');
+    return user;
+  };
+  const notSelf = (req, user, action) => {
+    if (user.id === req.space.id) throw new HttpError(400, `No puedes ${action} tu propio usuario`);
+  };
+
+  api.get('/s/:token/admin/users', async (req, res) => {
+    const today = D.isIsoDate(req.query.today) ? req.query.today : D.todayIso();
+    res.json(
+      await req.db.query(
+        `SELECT sp.id, sp.name, sp.token, sp.is_admin, sp.disabled, sp.created_at,
+                (SELECT COUNT(*)::int FROM sessions s WHERE s.space_id = sp.id) AS sessions,
+                (SELECT COUNT(*)::int FROM sessions s WHERE s.space_id = sp.id AND s.date >= $1) AS week,
+                (SELECT MAX(s.date) FROM sessions s WHERE s.space_id = sp.id) AS last_date,
+                EXISTS (SELECT 1 FROM sessions s WHERE s.space_id = sp.id AND s.in_progress) AS in_progress
+           FROM spaces sp ORDER BY sp.is_admin DESC, lower(sp.name), sp.id`,
+        [D.startOfWeek(today)]
+      )
+    );
+  });
+
+  api.post('/s/:token/admin/users', async (req, res) => {
+    const name = str(req.body.name, 80, 'name');
+    if (!name) throw new HttpError(400, 'El nombre es obligatorio');
+    const { id, token, is_admin, disabled, created_at } = await createSpace(req.db, { name });
+    res.status(201).json({ id, name, token, is_admin, disabled, created_at });
+  });
+
+  api.patch('/s/:token/admin/users/:id', async (req, res) => {
+    const user = await findUser(req);
+    if (req.body.name !== undefined) {
+      const name = str(req.body.name, 80, 'name');
+      if (!name) throw new HttpError(400, 'El nombre es obligatorio');
+      await req.db.query('UPDATE spaces SET name = $1 WHERE id = $2', [name, user.id]);
+    }
+    if (req.body.disabled !== undefined) {
+      notSelf(req, user, 'suspender');
+      await req.db.query('UPDATE spaces SET disabled = $1 WHERE id = $2', [!!req.body.disabled, user.id]);
+    }
+    res.json({ ok: true });
+  });
+
+  api.post('/s/:token/admin/users/:id/rotate', async (req, res) => {
+    const user = await findUser(req);
+    const token = newToken();
+    await req.db.query('UPDATE spaces SET token = $1 WHERE id = $2', [token, user.id]);
+    res.json({ token });
+  });
+
+  // Borra al usuario con todos sus datos. Primero las sesiones (y sus series): session_exercises
+  // apunta a exercises sin cascada, así que borrar el espacio de una vez chocaría con esa FK.
+  api.delete('/s/:token/admin/users/:id', async (req, res) => {
+    const user = await findUser(req);
+    notSelf(req, user, 'eliminar');
+    await req.db.tx(async (q) => {
+      await q.query('DELETE FROM sessions WHERE space_id = $1', [user.id]);
+      await q.query('DELETE FROM spaces WHERE id = $1', [user.id]);
+    });
+    res.json({ deleted: true });
   });
 
   // --- Ejercicios ---
@@ -323,7 +397,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     const to = D.isIsoDate(req.query.to) ? req.query.to : '9999-12-31';
     const limit = optInt(req.query.limit, 1, 1000, 'limit') || 200;
     const sessions = await req.db.query(
-      `SELECT s.id, s.date, s.title, s.duration_min, s.rpe, s.notes,
+      `SELECT s.id, s.date, s.title, s.duration_min, s.rpe, s.notes, s.in_progress,
               (SELECT COUNT(*)::int FROM session_exercises se WHERE se.session_id = s.id) AS exercise_count,
               (SELECT COUNT(*)::int FROM sets st JOIN session_exercises se ON se.id = st.session_exercise_id
                 WHERE se.session_id = s.id) AS set_count,
@@ -338,6 +412,15 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
   });
 
   const sessionId = (req) => optInt(req.params.id, 1, 2147483647, 'id');
+
+  // Sesión que se está registrando en vivo (la más reciente), o null.
+  api.get('/s/:token/sessions/active', async (req, res) => {
+    const row = await req.db.one(
+      'SELECT id FROM sessions WHERE space_id = $1 AND in_progress ORDER BY created_at DESC, id DESC LIMIT 1',
+      [req.space.id]
+    );
+    res.json(row ? await getSession(req.db, req.space.id, row.id) : null);
+  });
 
   api.get('/s/:token/sessions/:id', async (req, res) => {
     const s = await getSession(req.db, req.space.id, sessionId(req));
@@ -361,8 +444,8 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     await req.db.tx(async (q) => {
       await q.query(
         `UPDATE sessions SET date = $1, title = $2, duration_min = $3, rpe = $4, bodyweight = $5, notes = $6,
-                updated_at = now() WHERE id = $7`,
-        [data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes, id]
+                in_progress = $7, updated_at = now() WHERE id = $8`,
+        [data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes, data.in_progress, id]
       );
       await writeSessionChildren(q, id, data.exercises);
     });

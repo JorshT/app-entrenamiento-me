@@ -52,6 +52,78 @@
       .join(', ');
   }
 
+  // "8 × 62,5 kg"
+  const fmtSet = (s) => `${s.reps ?? '–'}${s.weight ? ` × ${fmtNum(s.weight, 2)} kg` : ' reps'}`;
+
+  // ---------- Comparación con la vez anterior ----------
+  // Misma fórmula que src/stats.js.
+  const e1rm = (w, r) => (!w || !r || r < 1 || r > 12 ? 0 : r === 1 ? w : w * (1 + r / 30));
+
+  // Compara una serie con la de la misma posición la vez anterior: 'up' | 'same' | 'down' | 'new'.
+  function compareSet(s, prev) {
+    if (!prev) return 'new';
+    const w = numOrNull(s.weight) || 0, r = numOrNull(s.reps) || 0;
+    const pw = numOrNull(prev.weight) || 0, pr = numOrNull(prev.reps) || 0;
+    if (w === pw && r === pr) return 'same';
+    if (w > pw || (w === pw && r > pr) || e1rm(w, r) > e1rm(pw, pr)) return 'up';
+    return 'down';
+  }
+
+  // "+2,5 kg" / "+2 reps" / "−1 rep"
+  function setDelta(s, prev) {
+    const dw = (numOrNull(s.weight) || 0) - (numOrNull(prev.weight) || 0);
+    const dr = (numOrNull(s.reps) || 0) - (numOrNull(prev.reps) || 0);
+    const sign = (n) => (n > 0 ? '+' : '−');
+    if (dw) return `${sign(dw)}${fmtNum(Math.abs(dw), 2)} kg`;
+    if (dr) return `${sign(dr)}${Math.abs(dr)} rep${Math.abs(dr) === 1 ? '' : 's'}`;
+    return 'igual';
+  }
+
+  function setsSummary(sets) {
+    let best = 0, volume = 0, reps = 0;
+    for (const s of sets) {
+      const w = numOrNull(s.weight) || 0, r = numOrNull(s.reps) || 0;
+      best = Math.max(best, e1rm(w, r));
+      volume += w * r;
+      reps += r;
+    }
+    return { best, volume, reps };
+  }
+
+  // ¿Superaste la vez anterior? Por 1RM estimado, por volumen (kg × reps) o, sin kilos, por reps totales.
+  function beatLast(sets, last) {
+    if (!last || !last.sets.length || !sets.length) return false;
+    const a = setsSummary(sets), b = setsSummary(last.sets);
+    return a.best > b.best || a.volume > b.volume || (!a.volume && !b.volume && a.reps > b.reps);
+  }
+
+  // Cuerpo que aceptan POST/PUT /sessions.
+  function sessionPayload(draft) {
+    return {
+      date: draft.date,
+      title: draft.title,
+      duration_min: numOrNull(draft.duration_min),
+      rpe: numOrNull(draft.rpe),
+      bodyweight: numOrNull(draft.bodyweight),
+      notes: draft.notes,
+      in_progress: !!draft.in_progress,
+      exercises: draft.exercises.map((ex) => ({
+        exercise_id: ex.exercise_id,
+        rest_sec: numOrNull(ex.rest_sec),
+        notes: ex.notes,
+        sets: ex.sets
+          .map((s) => ({ reps: numOrNull(s.reps), weight: numOrNull(s.weight), rir: numOrNull(s.rir) }))
+          .filter((s) => s.reps !== null || s.weight !== null),
+      })),
+    };
+  }
+
+  const liveBanner = (s) => (s ? `
+    <a class="live-banner" href="#/en-vivo/${s.id}">
+      <span><i class="dot"></i>Entrenamiento en curso${s.title ? ` · ${esc(s.title)}` : ''}</span>
+      <strong>Continuar →</strong>
+    </a>` : '');
+
   // ================= Token / acceso =================
   const TOKEN_KEY = 'entrenos:token';
   const match = location.pathname.match(/^\/t\/([A-Za-z0-9_-]{16,128})\/?$/);
@@ -68,15 +140,17 @@
   }
   store.set(TOKEN_KEY, token);
 
-  function renderLanding(invalid = false) {
+  // reason: undefined (sin enlace) | 'invalid' | 'suspended'
+  function renderLanding(reason) {
     $('#nav').hidden = true;
     view.innerHTML = `
       <div class="landing card">
         <img src="/icon.svg" alt="">
         <h1>Mis Entrenamientos</h1>
-        ${invalid
-          ? '<p>Este enlace no es válido o fue reemplazado por uno nuevo.</p>'
-          : '<p>Esta app no usa usuario ni contraseña: se entra con tu <strong>enlace único</strong> (termina en <code>/t/…</code>).</p>'}
+        ${{
+          invalid: '<p>Este enlace no es válido o fue reemplazado por uno nuevo. Pídele tu enlace actual a quien te lo dio.</p>',
+          suspended: '<p>Tu acceso está suspendido. Habla con quien te dio el enlace.</p>',
+        }[reason] || '<p>Esta app no usa usuario ni contraseña: se entra con tu <strong>enlace único</strong> (termina en <code>/t/…</code>).</p>'}
         <p class="small">Abre tu enlace desde el celular o el computador y quedará recordado en ese dispositivo.
         Si administras el servidor, puedes crear uno con <code>npm run new-link</code>.</p>
       </div>`;
@@ -150,6 +224,7 @@
   function startTimer(seconds) {
     timer.end = Date.now() + seconds * 1000;
     timerEl.hidden = false;
+    document.body.classList.add('timer-on');
     timerEl.classList.remove('done');
     clearInterval(timer.handle);
     timer.handle = setInterval(tickTimer, 250);
@@ -167,7 +242,7 @@
     }
     if (left < -15) stopTimer();
   }
-  function stopTimer() { clearInterval(timer.handle); timerEl.hidden = true; }
+  function stopTimer() { clearInterval(timer.handle); timerEl.hidden = true; document.body.classList.remove('timer-on'); }
   function beep() {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -191,11 +266,14 @@
   const routes = [
     [/^#\/resumen$/, () => viewSummary()],
     [/^#\/sesiones$/, () => viewSessions()],
-    [/^#\/sesion\/nueva(?:\?copia=(\d+))?$/, (m) => viewEditor(null, m[1] ? Number(m[1]) : null)],
+    [/^#\/sesion\/nueva$/, () => viewStartLive()],
+    [/^#\/sesion\/(?:manual|nueva)(?:\?copia=(\d+))?$/, (m) => viewEditor(null, m[1] ? Number(m[1]) : null)],
     [/^#\/sesion\/(\d+)$/, (m) => viewEditor(Number(m[1]))],
+    [/^#\/en-vivo\/(\d+)$/, (m) => viewLive(Number(m[1]))],
     [/^#\/ejercicios$/, () => viewExercises()],
     [/^#\/ejercicio\/(\d+)$/, (m) => viewExercise(Number(m[1]))],
     [/^#\/ajustes$/, () => viewSettings()],
+    [/^#\/usuarios$/, () => viewUsers()],
   ];
 
   let skipNextHash = false;
@@ -213,7 +291,8 @@
     state.charts = [];
     const found = routes.find(([re]) => re.test(hash));
     if (!found) { location.replace('#/resumen'); return; }
-    const section = hash.split(/[/?]/)[1];
+    const section = { 'en-vivo': 'sesion', usuarios: 'ajustes' }[hash.split(/[/?]/)[1]] || hash.split(/[/?]/)[1];
+    state.onOnline = null;
     $$('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === section));
     view.innerHTML = '<p class="muted">Cargando…</p>';
     window.scrollTo(0, 0);
@@ -226,6 +305,7 @@
     }
   }
   window.addEventListener('hashchange', route);
+  window.addEventListener('online', () => state.onOnline && state.onOnline());
   window.addEventListener('beforeunload', (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ''; } });
 
   // ================= Vista: Resumen =================
@@ -238,7 +318,10 @@
   }
 
   async function viewSummary() {
-    const s = await api('GET', `/stats?period=${state.period}&date=${state.date}&today=${todayIso()}`);
+    const [s, active] = await Promise.all([
+      api('GET', `/stats?period=${state.period}&date=${state.date}&today=${todayIso()}`),
+      api('GET', '/sessions/active').catch(() => null),
+    ]);
     const prevLabel = { week: 'sem. ant.', month: 'mes ant.', year: 'año ant.' }[s.period];
     const t = s.totals;
     const goal = s.period === 'week' ? s.weeklyGoal : Math.round(s.weeklyGoal * s.weeks);
@@ -246,6 +329,7 @@
     const perWeekLabel = s.period === 'week' ? 'esta semana' : `promedio semanal (${fmtNum(s.weeks, 1)} sem.)`;
 
     view.innerHTML = `
+      ${liveBanner(active)}
       <div class="period-bar">
         <div class="segmented" role="tablist">
           ${['week', 'month', 'year'].map((p) => `<button data-period="${p}" class="${p === s.period ? 'active' : ''}">${{ week: 'Semana', month: 'Mes', year: 'Año' }[p]}</button>`).join('')}
@@ -544,9 +628,11 @@
             <option value="">Todos los grupos</option>
             ${Object.entries(state.muscles).map(([k, v]) => `<option value="${k}" ${k === filterMuscle ? 'selected' : ''}>${esc(v)}</option>`).join('')}
           </select>
+          <a class="btn ghost" href="#/sesion/manual">Registrar pasada</a>
           <a class="btn" href="#/sesion/nueva">+ Nueva</a>
         </div>
       </div>
+      ${liveBanner(sessions.find((s) => s.in_progress))}
       <div id="session-groups"></div>`;
     $('#filter-muscle').addEventListener('change', (e) => {
       store.set('entrenos:filter', e.target.value);
@@ -558,10 +644,10 @@
   function sessionItem(s) {
     const d = parseIso(s.date);
     return `
-      <a class="session-item" href="#/sesion/${s.id}">
+      <a class="session-item" href="#/${s.in_progress ? 'en-vivo' : 'sesion'}/${s.id}">
         <div class="date"><span>${d.toLocaleDateString('es', { weekday: 'short' })}</span><b>${d.getDate()}</b><span>${d.toLocaleDateString('es', { month: 'short' })}</span></div>
         <div style="min-width:0">
-          <div class="title">${esc(s.title || 'Entrenamiento')}</div>
+          <div class="title">${esc(s.title || 'Entrenamiento')}${s.in_progress ? ' <span class="chip live">En curso</span>' : ''}</div>
           <div class="chips">${s.muscles.map((m) => `<span class="chip">${esc(muscleLabel(m))}</span>`).join('')}</div>
           ${s.notes ? `<div class="muted small" style="margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(s.notes)}</div>` : ''}
         </div>
@@ -589,6 +675,7 @@
     let restored = false;
     if (id) {
       draft = await api('GET', `/sessions/${id}`);
+      if (draft.in_progress) { location.replace(`#/en-vivo/${id}`); return; }
     } else if (copyFrom) {
       const src = await api('GET', `/sessions/${copyFrom}`);
       draft = { ...src, id: undefined, date: todayIso(), notes: '', duration_min: null, rpe: null, bodyweight: null };
@@ -612,9 +699,9 @@
 
     view.innerHTML = `
       <div class="page-head">
-        <h1>${id ? 'Editar sesión' : 'Nueva sesión'}</h1>
+        <h1>${id ? 'Editar sesión' : 'Registrar sesión'}</h1>
         <div class="row">
-          ${id ? `<a class="btn ghost small" href="#/sesion/nueva?copia=${id}">Repetir sesión</a>` : ''}
+          ${id ? `<a class="btn ghost small" href="#/sesion/manual?copia=${id}">Repetir sesión</a>` : ''}
           ${restored ? '<button class="btn ghost small" id="discard">Descartar borrador</button>' : ''}
         </div>
       </div>
@@ -690,6 +777,7 @@
         const el = $(`#last-${i}`);
         if (el && last) {
           el.textContent = `Última vez (${fmtDate(last.date)}): ${fmtSets(last.sets) || 'sin series'}${last.rest_sec ? ` · descanso ${last.rest_sec}s` : ''}${last.notes ? ` · “${last.notes}”` : ''}`;
+          if (beatLast(ex.sets, last)) el.insertAdjacentHTML('beforeend', ' <span class="beat">🏆 Superada</span>');
         }
       });
     };
@@ -779,22 +867,7 @@
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const payload = {
-        date: draft.date,
-        title: draft.title,
-        duration_min: numOrNull(draft.duration_min),
-        rpe: numOrNull(draft.rpe),
-        bodyweight: numOrNull(draft.bodyweight),
-        notes: draft.notes,
-        exercises: draft.exercises.map((ex) => ({
-          exercise_id: ex.exercise_id,
-          rest_sec: numOrNull(ex.rest_sec),
-          notes: ex.notes,
-          sets: ex.sets
-            .map((s) => ({ reps: numOrNull(s.reps), weight: numOrNull(s.weight), rir: numOrNull(s.rir) }))
-            .filter((s) => s.reps !== null || s.weight !== null),
-        })),
-      };
+      const payload = sessionPayload(draft);
       const btn = form.querySelector('[type=submit]');
       btn.disabled = true;
       try {
@@ -807,6 +880,380 @@
         toast(err.message, true);
         btn.disabled = false;
       }
+    });
+  }
+
+  // ================= Vista: Entrenamiento en vivo =================
+  // Se anota a medida que entrenas: agregas un ejercicio, confirmas cada serie y todo se guarda solo.
+  const liveKey = (id) => `entrenos:live:${token}:${id}`;
+
+  async function viewStartLive() {
+    const active = await api('GET', '/sessions/active');
+    if (active) { location.replace(`#/en-vivo/${active.id}`); return; }
+    view.innerHTML = `
+      <div class="page-head"><h1>Nuevo entrenamiento</h1></div>
+      <form id="start" class="card stack" autocomplete="off">
+        <p class="muted" style="margin:0">Empieza ahora y ve anotando cada ejercicio y serie a medida que la haces.
+          Verás lo que hiciste la vez anterior para superarlo. Se guarda solo.</p>
+        <label class="field">Nombre / enfoque (opcional)<input name="title" placeholder="Ej.: Torso, Pierna, Push…" maxlength="120"></label>
+        <button class="btn" type="submit">Empezar entrenamiento</button>
+      </form>
+      <p class="muted small" style="margin-top:16px">¿Quieres registrar un entrenamiento que ya hiciste? <a href="#/sesion/manual">Registrar sesión pasada</a></p>`;
+    $('#start').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = e.target.querySelector('[type=submit]');
+      btn.disabled = true;
+      try {
+        const title = new FormData(e.target).get('title').trim();
+        const s = await api('POST', '/sessions', { date: todayIso(), title, in_progress: true, exercises: [] });
+        location.hash = `#/en-vivo/${s.id}`;
+      } catch (err) {
+        toast(err.message, true);
+        btn.disabled = false;
+      }
+    });
+  }
+
+  async function viewLive(id) {
+    lastCache.clear();
+    const server = await api('GET', `/sessions/${id}`);
+    if (!server.in_progress) { location.replace(`#/sesion/${id}`); return; }
+    let draft = server;
+    let pendingLocal = false;
+    try {
+      const local = JSON.parse(store.get(liveKey(id)) || 'null');
+      // Cambios que no alcanzaron a subir (sin conexión, pestaña cerrada…).
+      if (local && local.pending && local.draft) { draft = local.draft; pendingLocal = true; }
+    } catch { /* copia local corrupta */ }
+    draft.in_progress = true;
+    draft.exercises = draft.exercises.map((e) => ({
+      exercise_id: e.exercise_id, rest_sec: e.rest_sec, notes: e.notes || '',
+      sets: e.sets.map((s) => ({ reps: s.reps, weight: s.weight, rir: s.rir })),
+    }));
+
+    // Última vez de cada ejercicio (objetivo a superar).
+    const lasts = new Map();
+    await Promise.all(draft.exercises.map(async (ex) => {
+      lasts.set(ex.exercise_id, await lastTime(ex.exercise_id, id).catch(() => null));
+    }));
+
+    let open = draft.exercises[draft.exercises.length - 1] || null; // ejercicio expandido
+    const nextVals = new WeakMap(); // lo escrito en "siguiente serie", por ejercicio
+
+    // ---------- Autoguardado ----------
+    const saver = { timer: null, current: null, again: false, closed: false };
+    const setStatus = (text, cls = '') => {
+      const el = $('#save-state');
+      if (el) { el.textContent = text; el.className = cls; }
+    };
+    const flush = async () => {
+      clearTimeout(saver.timer);
+      if (saver.closed) return;
+      if (saver.current) { saver.again = true; return saver.current; }
+      saver.current = (async () => {
+        try {
+          await api('PUT', `/sessions/${id}`, sessionPayload(draft));
+          if (!saver.again) {
+            store.del(liveKey(id));
+            setStatus('Guardado ✓', 'ok');
+          }
+        } catch (err) {
+          setStatus(err.status ? `No se guardó: ${err.message}` : 'Sin conexión · se reintentará', 'warn');
+        }
+      })();
+      await saver.current;
+      saver.current = null;
+      if (saver.again) { saver.again = false; await flush(); }
+    };
+    const save = (now = false) => {
+      if (saver.closed) return;
+      store.set(liveKey(id), JSON.stringify({ pending: true, draft }));
+      setStatus('Guardando…');
+      clearTimeout(saver.timer);
+      saver.timer = setTimeout(flush, now ? 0 : 800);
+    };
+    const stopSaving = async () => {
+      saver.closed = true;
+      saver.again = false;
+      clearTimeout(saver.timer);
+      await saver.current;
+    };
+    state.onOnline = () => { if (store.get(liveKey(id))) flush(); };
+
+    const started = new Date(draft.created_at);
+    view.innerHTML = `
+      <div class="live-head">
+        <div class="live-title">
+          <input data-f="title" value="${esc(draft.title)}" placeholder="Entrenamiento de hoy" maxlength="120" aria-label="Nombre del entrenamiento">
+          <div class="muted small">Empezaste ${started.toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })} · <span id="save-state">Guardado ✓</span></div>
+        </div>
+        <button type="button" class="btn" id="finish">Terminar</button>
+      </div>
+      <div id="live-list"></div>
+      <button type="button" class="btn ghost live-add" id="add-ex">+ Agregar ejercicio</button>`;
+    const list = $('#live-list');
+
+    // Siguiente serie: la de la vez anterior (objetivo), sin bajar del peso que ya usaste hoy.
+    const nextDefaults = (ex) => {
+      const target = lasts.get(ex.exercise_id)?.sets[ex.sets.length];
+      const prev = ex.sets[ex.sets.length - 1];
+      const src = target || prev || {};
+      const weight = target && prev && (prev.weight || 0) > (target.weight || 0) ? prev.weight : src.weight;
+      return { reps: src.reps ?? '', weight: weight ?? '', rir: '' };
+    };
+    const nextOf = (ex) => nextVals.get(ex) || nextDefaults(ex);
+
+    const cmpLabel = (s, prev) => {
+      const c = compareSet(s, prev);
+      if (c === 'new') return '<span></span>';
+      return `<span class="cmp ${c}">${{ up: '↑', same: '=', down: '↓' }[c]} ${c === 'same' ? '' : setDelta(s, prev)}</span>`;
+    };
+
+    const stepper = (f, label, value, step, mode) => `
+      <div class="stepper">
+        <span>${label}</span>
+        <div>
+          <button type="button" class="btn ghost icon" data-act="step" data-f="${f}" data-d="-${step}" aria-label="Menos ${label}">−</button>
+          <input inputmode="${mode}" data-next="${f}" value="${esc(value)}" aria-label="${label}">
+          <button type="button" class="btn ghost icon" data-act="step" data-f="${f}" data-d="${step}" aria-label="Más ${label}">+</button>
+        </div>
+      </div>`;
+
+    const render = () => {
+      if (!draft.exercises.length) {
+        list.innerHTML = `<div class="card empty" style="padding:24px 16px">
+          <p style="margin:0">Agrega el ejercicio que vas a hacer y anota cada serie al terminarla.</p></div>`;
+        return;
+      }
+      list.innerHTML = draft.exercises.map((ex, i) => {
+        const info = state.exById.get(ex.exercise_id) || { name: '¿?', muscle: 'otro', secondary: [] };
+        const last = lasts.get(ex.exercise_id);
+        const beat = beatLast(ex.sets, last);
+        if (ex !== open) {
+          return `
+            <button type="button" class="ex-card live-ex collapsed" data-act="open" data-i="${i}">
+              <strong>${i + 1}. ${esc(info.name)}</strong>
+              ${beat ? '<span class="beat">🏆</span>' : ''}
+              <span class="muted small">${ex.sets.length ? esc(fmtSets(ex.sets)) : 'sin series'}</span>
+            </button>`;
+        }
+        const next = nextOf(ex);
+        const target = last?.sets[ex.sets.length];
+        return `
+          <div class="ex-card live-ex" data-i="${i}">
+            <div class="ex-head">
+              <div class="name">
+                <strong>${i + 1}. ${esc(info.name)}</strong>
+                <div class="chips"><span class="chip main">${esc(muscleLabel(info.muscle))}</span>${info.secondary.map((m) => `<span class="chip">${esc(muscleLabel(m))}</span>`).join('')}</div>
+              </div>
+              <button type="button" class="btn ghost icon" data-act="remove-ex" data-i="${i}" aria-label="Quitar ejercicio">✕</button>
+            </div>
+            <div class="ex-last">${last
+              ? `Última vez (${fmtDate(last.date)}): ${esc(fmtSets(last.sets) || 'sin series')}${last.notes ? ` · “${esc(last.notes)}”` : ''}`
+              : 'Primera vez que registras este ejercicio.'}</div>
+            ${beat ? '<div class="beat big">🏆 Superaste la vez anterior</div>' : ''}
+            ${ex.sets.length ? `<ol class="done-sets">${ex.sets.map((s, j) => `
+              <li>
+                <span class="n">${j + 1}</span>
+                <span class="v">${esc(fmtSet(s))}${s.rir !== null && s.rir !== '' && s.rir !== undefined ? ` <small class="muted">RIR ${esc(s.rir)}</small>` : ''}</span>
+                ${cmpLabel(s, last?.sets[j])}
+                <button type="button" class="btn ghost icon" data-act="edit-set" data-i="${i}" data-j="${j}" aria-label="Editar serie ${j + 1}">✎</button>
+              </li>`).join('')}</ol>` : ''}
+            <div class="next-set" data-i="${i}">
+              <div class="next-label">Serie ${ex.sets.length + 1}${target ? ` · a superar: <strong>${esc(fmtSet(target))}</strong>` : ''}</div>
+              <div class="steppers">
+                ${stepper('reps', 'Reps', next.reps, 1, 'numeric')}
+                ${stepper('weight', 'Kg', next.weight, 2.5, 'decimal')}
+                <label class="stepper rir"><span>RIR</span><input inputmode="numeric" data-next="rir" value="${esc(next.rir)}" placeholder="–" aria-label="Repeticiones en reserva"></label>
+              </div>
+              <button type="button" class="btn done-btn" data-act="done" data-i="${i}">✓ Serie hecha</button>
+            </div>
+            <details class="live-more">
+              <summary>Descanso ${ex.rest_sec ? `${esc(ex.rest_sec)}s` : '90s'} · comentarios${ex.notes ? ' ✎' : ''}</summary>
+              <div class="row" style="flex-wrap:nowrap;align-items:flex-end">
+                <label class="field" style="max-width:130px">Descanso (seg)<input inputmode="numeric" data-i="${i}" data-f="rest_sec" value="${esc(ex.rest_sec ?? '')}" placeholder="90"></label>
+                <button type="button" class="btn ghost small" data-act="timer" data-i="${i}" title="Iniciar descanso">⏱ Descanso</button>
+              </div>
+              <label class="field">Comentarios del ejercicio<input data-i="${i}" data-f="notes" value="${esc(ex.notes)}" placeholder="Técnica, sensaciones, ajustes de máquina…" maxlength="2000"></label>
+            </details>
+          </div>`;
+      }).join('');
+    };
+    render();
+    if (pendingLocal) save(true);
+
+    $('.live-title input').addEventListener('input', (e) => { draft.title = e.target.value; save(); });
+
+    list.addEventListener('input', (e) => {
+      const el = e.target;
+      const card = el.closest('[data-i]');
+      const ex = card && draft.exercises[card.dataset.i];
+      if (!ex) return;
+      if (el.dataset.next) {
+        nextVals.set(ex, { ...nextOf(ex), [el.dataset.next]: el.value });
+      } else if (el.dataset.f) {
+        ex[el.dataset.f] = el.value;
+        save();
+      }
+    });
+
+    list.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-act]');
+      if (!b) return;
+      const i = Number(b.closest('[data-i]').dataset.i);
+      const ex = draft.exercises[i];
+      const last = lasts.get(ex.exercise_id);
+      switch (b.dataset.act) {
+        case 'open':
+          open = ex;
+          render();
+          $(`.live-ex[data-i="${i}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          return;
+        case 'step': {
+          const cur = nextOf(ex);
+          const v = Math.max(0, Math.round(((numOrNull(cur[b.dataset.f]) || 0) + Number(b.dataset.d)) * 100) / 100);
+          nextVals.set(ex, { ...cur, [b.dataset.f]: v });
+          $(`.next-set input[data-next="${b.dataset.f}"]`, list).value = v;
+          return;
+        }
+        case 'done': {
+          const v = nextOf(ex);
+          const set = { reps: numOrNull(v.reps), weight: numOrNull(v.weight), rir: numOrNull(v.rir) };
+          if (set.reps === null && set.weight === null) { toast('Anota las reps o los kilos', true); return; }
+          const prev = last?.sets[ex.sets.length];
+          const wasBeaten = beatLast(ex.sets, last);
+          ex.sets.push(set);
+          nextVals.delete(ex);
+          if (!wasBeaten && beatLast(ex.sets, last)) toast('🏆 ¡Superaste la vez anterior!');
+          else if (compareSet(set, prev) === 'up') toast(`↑ ${setDelta(set, prev)} vs la vez anterior`);
+          startTimer(numOrNull(ex.rest_sec) || 90);
+          save(true);
+          render();
+          return;
+        }
+        case 'edit-set':
+          editLiveSet(ex, Number(b.dataset.j), () => { save(true); render(); });
+          return;
+        case 'remove-ex':
+          if (ex.sets.length && !confirm('¿Quitar este ejercicio y sus series?')) return;
+          draft.exercises.splice(i, 1);
+          if (open === ex) open = draft.exercises[draft.exercises.length - 1] || null;
+          save(true);
+          render();
+          return;
+        case 'timer':
+          startTimer(numOrNull(ex.rest_sec) || 90);
+          return;
+        default:
+      }
+    });
+
+    $('#add-ex').addEventListener('click', () => pickExercise(async (exercise) => {
+      const last = await lastTime(exercise.id, id).catch(() => null);
+      lasts.set(exercise.id, last);
+      const ex = { exercise_id: exercise.id, rest_sec: last ? last.rest_sec : null, notes: '', sets: [] };
+      draft.exercises.push(ex);
+      open = ex;
+      save(true);
+      render();
+      list.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }));
+
+    $('#finish').addEventListener('click', () => {
+      const withSets = draft.exercises.filter((ex) => ex.sets.length);
+      const compared = withSets.filter((ex) => lasts.get(ex.exercise_id)?.sets.length);
+      const beaten = compared.filter((ex) => beatLast(ex.sets, lasts.get(ex.exercise_id)));
+      const minutes = Math.max(1, Math.round((Date.now() - started) / 60000));
+      const nSets = withSets.reduce((a, ex) => a + ex.sets.length, 0);
+      const m = openModal(`
+        <form method="dialog" id="finish-form" autocomplete="off">
+          <div class="modal-head"><h2>Terminar entrenamiento</h2><button type="button" class="btn ghost icon" data-close aria-label="Cerrar">✕</button></div>
+          <div class="modal-body">
+            <p style="margin:0">${withSets.length} ejercicio${withSets.length === 1 ? '' : 's'} · ${nSets} serie${nSets === 1 ? '' : 's'}${compared.length ? `<br>🏆 Superaste la vez anterior en <strong>${beaten.length} de ${compared.length}</strong> ejercicio${compared.length === 1 ? '' : 's'}` : ''}</p>
+            ${withSets.length ? '' : '<p class="hint warn">No anotaste ninguna serie. Puedes descartar este entrenamiento.</p>'}
+            <div class="fields">
+              <label class="field">Duración (min)<input inputmode="numeric" name="duration_min" value="${minutes}"></label>
+              <label class="field">Esfuerzo (RPE 1-10)<select name="rpe"><option value="">—</option>${[...Array(10)].map((_, i) => `<option>${i + 1}</option>`).join('')}</select></label>
+              <label class="field full">Peso corporal (kg)<input inputmode="decimal" name="bodyweight" value="${esc(draft.bodyweight ?? '')}" placeholder="opcional"></label>
+              <label class="field full">Comentarios de la sesión<textarea name="notes" maxlength="4000" placeholder="Cómo te sentiste, sueño, molestias…">${esc(draft.notes)}</textarea></label>
+            </div>
+          </div>
+          <div class="modal-foot">
+            <button type="button" class="btn danger" id="discard-live">Descartar</button>
+            <span class="spacer"></span>
+            <button type="button" class="btn ghost" data-close>Seguir</button>
+            <button type="submit" class="btn">Guardar</button>
+          </div>
+        </form>`);
+      $('#discard-live', m).addEventListener('click', async () => {
+        if (!confirm('¿Descartar este entrenamiento? Se borran todas sus series.')) return;
+        await stopSaving();
+        try {
+          await api('DELETE', `/sessions/${id}`);
+        } catch (err) {
+          if (err.status !== 404) { saver.closed = false; toast(err.message, true); return; }
+        }
+        store.del(liveKey(id));
+        m.close();
+        toast('Entrenamiento descartado');
+        location.hash = '#/sesiones';
+      });
+      $('#finish-form', m).addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.target);
+        const btn = e.target.querySelector('[type=submit]');
+        btn.disabled = true;
+        await stopSaving(); // que un guardado pendiente no vuelva a marcarla "en curso"
+        const final = { ...draft, in_progress: false, duration_min: fd.get('duration_min'), rpe: fd.get('rpe'), bodyweight: fd.get('bodyweight'), notes: fd.get('notes') };
+        try {
+          await api('PUT', `/sessions/${id}`, sessionPayload(final));
+          store.del(liveKey(id));
+          stopTimer();
+          m.close();
+          toast(beaten.length ? `Entrenamiento guardado ✔ · 🏆 ${beaten.length} de ${compared.length}` : 'Entrenamiento guardado ✔');
+          location.hash = '#/sesiones';
+        } catch (err) {
+          saver.closed = false;
+          toast(err.status ? err.message : 'Sin conexión. Inténtalo de nuevo.', true);
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  // Editar o borrar una serie ya anotada en vivo.
+  function editLiveSet(ex, j, onDone) {
+    const s = ex.sets[j];
+    const m = openModal(`
+      <form method="dialog" id="set-form" autocomplete="off">
+        <div class="modal-head"><h2>Serie ${j + 1}</h2><button type="button" class="btn ghost icon" data-close aria-label="Cerrar">✕</button></div>
+        <div class="modal-body">
+          <div class="fields">
+            <label class="field">Reps<input inputmode="numeric" name="reps" value="${esc(s.reps ?? '')}"></label>
+            <label class="field">Kg<input inputmode="decimal" name="weight" value="${esc(s.weight ?? '')}"></label>
+            <label class="field">RIR<input inputmode="numeric" name="rir" value="${esc(s.rir ?? '')}" placeholder="–"></label>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button type="button" class="btn danger" id="del-set">Borrar</button>
+          <span class="spacer"></span>
+          <button type="button" class="btn ghost" data-close>Cancelar</button>
+          <button type="submit" class="btn">Guardar</button>
+        </div>
+      </form>`);
+    $('#del-set', m).addEventListener('click', () => {
+      ex.sets.splice(j, 1);
+      m.close();
+      onDone();
+    });
+    $('#set-form', m).addEventListener('submit', (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const set = { reps: numOrNull(fd.get('reps')), weight: numOrNull(fd.get('weight')), rir: numOrNull(fd.get('rir')) };
+      if (set.reps === null && set.weight === null) { toast('Anota las reps o los kilos', true); return; }
+      ex.sets[j] = set;
+      m.close();
+      onDone();
     });
   }
 
@@ -1010,9 +1457,19 @@
           <p class="muted small" style="margin-top:0">Es la llave de tus datos: quien lo tenga puede verlos y editarlos. Guárdalo en favoritos o
             agrégalo a la pantalla de inicio del celular (menú del navegador → “Agregar a pantalla de inicio”).</p>
           <div class="link-box"><input readonly value="${esc(link)}" id="link"><button class="btn ghost" id="copy">Copiar</button></div>
-          <p class="muted small">Si crees que alguien más lo tiene, genera uno nuevo: el anterior dejará de funcionar en todos tus dispositivos.</p>
-          <button class="btn danger" id="rotate">Generar enlace nuevo</button>
+          ${state.me.is_admin
+            ? `<p class="muted small">Si crees que alguien más lo tiene, genera uno nuevo: el anterior dejará de funcionar en todos tus dispositivos.</p>
+               <button class="btn danger" id="rotate">Generar enlace nuevo</button>`
+            : '<p class="muted small">Si perdiste tu enlace o crees que alguien más lo tiene, pide uno nuevo a quien te lo dio.</p>'}
         </section>
+
+        ${state.me.is_admin ? `
+        <section class="card">
+          <h2>Usuarios</h2>
+          <p class="muted small" style="margin-top:0">Crea enlaces para otras personas: cada una tiene sus propios datos.
+            Si alguien pierde su enlace, desde aquí le generas uno nuevo.</p>
+          <a class="btn" href="#/usuarios">Administrar usuarios →</a>
+        </section>` : ''}
 
         <section class="card">
           <h2>Respaldo</h2>
@@ -1039,11 +1496,8 @@
         toast('Ajustes guardados');
       } catch (err) { toast(err.message, true); }
     });
-    $('#copy').addEventListener('click', async () => {
-      try { await navigator.clipboard.writeText(link); } catch { $('#link').select(); document.execCommand('copy'); }
-      toast('Enlace copiado');
-    });
-    $('#rotate').addEventListener('click', async () => {
+    $('#copy').addEventListener('click', () => copyText(link));
+    $('#rotate')?.addEventListener('click', async () => {
       if (!confirm('Se generará un enlace nuevo y el actual dejará de funcionar. ¿Continuar?')) return;
       const r = await api('POST', '/rotate');
       store.set(TOKEN_KEY, r.token);
@@ -1080,6 +1534,162 @@
     });
   }
 
+  // ================= Vista: Usuarios (administrador) =================
+  const userLink = (tok) => `${location.origin}/t/${tok}`;
+
+  async function copyText(text, msg = 'Enlace copiado') {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const t = document.createElement('textarea');
+      t.value = text;
+      document.body.append(t);
+      t.select();
+      document.execCommand('copy');
+      t.remove();
+    }
+    toast(msg);
+  }
+
+  // Compartir (WhatsApp, correo…) donde el navegador lo permita; si no, copia.
+  async function shareLink(name, link) {
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'Mis Entrenamientos', text: `Hola ${name}, este es tu enlace para registrar tus entrenamientos (no lo compartas):`, url: link });
+        return;
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+      }
+    }
+    copyText(link);
+  }
+
+  function showLinkModal(user, title, note) {
+    const link = userLink(user.token);
+    const m = openModal(`
+      <div class="modal-head"><h2>${esc(title)}</h2><button class="btn ghost icon" data-close aria-label="Cerrar">✕</button></div>
+      <div class="modal-body">
+        <p style="margin:0">Envíale este enlace a <strong>${esc(user.name)}</strong>. Es su llave: quien lo tenga entra a sus datos.</p>
+        <div class="link-box"><input readonly value="${esc(link)}"><button class="btn ghost" data-copy>Copiar</button></div>
+        ${note ? `<p class="hint">${esc(note)}</p>` : ''}
+      </div>
+      <div class="modal-foot"><button class="btn ghost" data-close>Listo</button><button class="btn" data-share>Compartir</button></div>`);
+    $('[data-copy]', m).addEventListener('click', () => copyText(link));
+    $('[data-share]', m).addEventListener('click', () => shareLink(user.name, link));
+  }
+
+  async function viewUsers() {
+    if (!state.me.is_admin) { location.replace('#/resumen'); return; }
+    const users = await api('GET', `/admin/users?today=${todayIso()}`);
+    const activity = (u) => {
+      if (!u.sessions) return 'Aún no entrena';
+      return `${u.sessions} sesión${u.sessions === 1 ? '' : 'es'} · ${u.week} esta semana · última: ${fmtDate(u.last_date)}`;
+    };
+    view.innerHTML = `
+      <div class="page-head">
+        <h1>Usuarios</h1>
+        <button class="btn" id="new-user">+ Nuevo usuario</button>
+      </div>
+      <p class="hint">No abras sus enlaces en este navegador: la app recordaría el de ellos en vez del tuyo.
+        Usa <strong>Copiar</strong> o <strong>Compartir</strong> para enviárselos.</p>
+      <div class="user-list">
+        ${users.map((u) => `
+          <div class="user-card${u.disabled ? ' disabled' : ''}" data-id="${u.id}">
+            <div class="user-main">
+              <div class="user-name">
+                <strong>${esc(u.name)}</strong>
+                ${u.token === token ? '<span class="chip main">Tú · admin</span>' : ''}
+                ${u.disabled ? '<span class="chip warn">Suspendido</span>' : ''}
+                ${u.in_progress ? '<span class="chip live">Entrenando</span>' : ''}
+              </div>
+              <div class="muted small">${activity(u)}</div>
+            </div>
+            <div class="user-actions">
+              <button class="btn ghost small" data-act="copy">Copiar enlace</button>
+              <button class="btn ghost small" data-act="share">Compartir</button>
+              <details class="menu">
+                <summary class="btn ghost small icon" aria-label="Más acciones">⋯</summary>
+                <div class="menu-list">
+                  <button data-act="rename">Cambiar nombre</button>
+                  <button data-act="rotate">Generar enlace nuevo</button>
+                  ${u.token === token ? '' : `<button data-act="toggle">${u.disabled ? 'Reactivar acceso' : 'Suspender acceso'}</button>
+                  <button data-act="delete" class="danger">Eliminar usuario</button>`}
+                </div>
+              </details>
+            </div>
+          </div>`).join('')}
+      </div>`;
+
+    $('#new-user').addEventListener('click', () => {
+      const m = openModal(`
+        <form method="dialog" id="user-form" autocomplete="off">
+          <div class="modal-head"><h2>Nuevo usuario</h2><button type="button" class="btn ghost icon" data-close aria-label="Cerrar">✕</button></div>
+          <div class="modal-body">
+            <label class="field">Nombre<input name="name" required maxlength="80" placeholder="Ej.: Ana" autofocus></label>
+            <p class="muted small" style="margin:0">Se crea su espacio con el catálogo de ejercicios y un enlace propio para entrar.</p>
+          </div>
+          <div class="modal-foot"><button type="button" class="btn ghost" data-close>Cancelar</button><button class="btn" type="submit">Crear</button></div>
+        </form>`);
+      $('#user-form', m).addEventListener('submit', async (e) => {
+        e.preventDefault();
+        try {
+          const user = await api('POST', '/admin/users', { name: new FormData(e.target).get('name') });
+          m.close();
+          await route();
+          showLinkModal(user, 'Usuario creado');
+        } catch (err) { toast(err.message, true); }
+      });
+    });
+
+    $('.user-list').addEventListener('click', async (e) => {
+      const b = e.target.closest('button[data-act]');
+      if (!b) return;
+      const u = users.find((x) => x.id === Number(b.closest('[data-id]').dataset.id));
+      b.closest('details')?.removeAttribute('open');
+      try {
+        switch (b.dataset.act) {
+          case 'copy': return copyText(userLink(u.token));
+          case 'share': return shareLink(u.name, userLink(u.token));
+          case 'rename': {
+            const name = prompt('Nuevo nombre', u.name);
+            if (!name || !name.trim() || name.trim() === u.name) return;
+            await api('PATCH', `/admin/users/${u.id}`, { name });
+            if (u.token === token) await loadMe();
+            toast('Nombre actualizado');
+            return route();
+          }
+          case 'rotate': {
+            const self = u.token === token;
+            if (!confirm(self
+              ? 'Se generará un enlace nuevo para ti y el actual dejará de funcionar en todos tus dispositivos. ¿Continuar?'
+              : `Se generará un enlace nuevo para ${u.name} y el actual dejará de funcionar. ¿Continuar?`)) return;
+            const { token: tok } = await api('POST', `/admin/users/${u.id}/rotate`);
+            if (self) {
+              store.set(TOKEN_KEY, tok);
+              location.replace(`/t/${tok}#/usuarios`);
+              return;
+            }
+            showLinkModal({ ...u, token: tok }, 'Enlace nuevo', 'El enlace anterior ya no funciona.');
+            return;
+          }
+          case 'toggle': {
+            if (!u.disabled && !confirm(`¿Suspender el acceso de ${u.name}? Sus datos se conservan y puedes reactivarlo cuando quieras.`)) return;
+            await api('PATCH', `/admin/users/${u.id}`, { disabled: !u.disabled });
+            toast(u.disabled ? 'Acceso reactivado' : 'Acceso suspendido');
+            return route();
+          }
+          case 'delete': {
+            if (!confirm(`¿Eliminar a ${u.name} y todos sus entrenamientos? No se puede deshacer.`)) return;
+            await api('DELETE', `/admin/users/${u.id}`);
+            toast('Usuario eliminado');
+            return route();
+          }
+          default:
+        }
+      } catch (err) { toast(err.message, true); }
+    });
+  }
+
   // ================= Arranque =================
   async function loadMe() {
     const me = await api('GET', '/me');
@@ -1095,9 +1705,11 @@
     } catch (err) {
       if (err.status === 404) {
         store.del(TOKEN_KEY);
-        renderLanding(true);
+        renderLanding('invalid');
         return;
       }
+      // Suspendido: se conserva el enlace para que vuelva a funcionar si lo reactivan.
+      if (err.status === 403) { renderLanding('suspended'); return; }
       view.innerHTML = `<div class="empty"><p>No se pudo conectar con el servidor.</p><button class="btn ghost" onclick="location.reload()">Reintentar</button></div>`;
       return;
     }
