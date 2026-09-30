@@ -3,100 +3,122 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const Database = require('better-sqlite3');
 const { DEFAULT_EXERCISES } = require('./catalog');
 
-function openDb(file) {
-  if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
-  const db = new Database(file);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  migrate(db);
+const SCHEMA = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'schema.sql'), 'utf8');
+const DATE_OID = 1082;
+
+// Interfaz común para Postgres (Supabase) y PGlite (local/pruebas):
+//   db.query(sql, params) -> filas
+//   db.one(sql, params)   -> primera fila o null
+//   db.tx(async (q) => …) -> ejecuta en una transacción; q tiene query/one
+function wrap(queryFn) {
+  const q = {
+    query: async (sql, params = []) => (await queryFn(sql, params)).rows,
+    one: async (sql, params = []) => (await queryFn(sql, params)).rows[0] || null,
+  };
+  return q;
+}
+
+// Postgres real, p. ej. Supabase. DATABASE_URL = cadena de conexión.
+function connectPg(url) {
+  const { Pool, types } = require('pg');
+  types.setTypeParser(DATE_OID, (v) => v); // fechas como 'YYYY-MM-DD'
+  const local = /@(localhost|127\.0\.0\.1)[:/]/.test(url);
+  const pool = new Pool({
+    connectionString: url,
+    ssl: local ? false : { rejectUnauthorized: false },
+    max: Number(process.env.PG_POOL_MAX) || 3,
+    idleTimeoutMillis: 10000,
+  });
+  const db = wrap((sql, params) => pool.query(sql, params));
+  db.exec = (sql) => pool.query(sql);
+  db.tx = async (fn) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await fn(wrap((sql, params) => client.query(sql, params)));
+      await client.query('COMMIT');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  };
+  db.close = () => pool.end();
   return db;
 }
 
-function migrate(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS spaces (
-      id          INTEGER PRIMARY KEY,
-      token       TEXT NOT NULL UNIQUE,
-      name        TEXT NOT NULL DEFAULT 'Mis entrenamientos',
-      weekly_goal INTEGER NOT NULL DEFAULT 4,
-      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+// Postgres embebido (sin instalar nada). dir = carpeta de datos, o undefined = en memoria.
+async function connectPglite(dir) {
+  const { PGlite } = require('@electric-sql/pglite');
+  if (dir) fs.mkdirSync(dir, { recursive: true });
+  const pg = new PGlite({ dataDir: dir, parsers: { [DATE_OID]: (v) => v } });
+  await pg.waitReady;
+  let chain = Promise.resolve();
+  // PGlite tiene una sola conexión: serializamos las transacciones.
+  const db = wrap((sql, params) => pg.query(sql, params));
+  db.exec = (sql) => pg.exec(sql);
+  db.tx = (fn) => {
+    const run = chain.then(() => pg.transaction((tx) => fn(wrap((sql, params) => tx.query(sql, params)))));
+    chain = run.catch(() => {});
+    return run;
+  };
+  db.close = () => pg.close();
+  return db;
+}
 
-    CREATE TABLE IF NOT EXISTS exercises (
-      id        INTEGER PRIMARY KEY,
-      space_id  INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-      name      TEXT NOT NULL,
-      muscle    TEXT NOT NULL,
-      secondary TEXT NOT NULL DEFAULT '',
-      archived  INTEGER NOT NULL DEFAULT 0,
-      UNIQUE (space_id, name)
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      id           INTEGER PRIMARY KEY,
-      space_id     INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
-      date         TEXT NOT NULL,
-      title        TEXT NOT NULL DEFAULT '',
-      duration_min INTEGER,
-      rpe          INTEGER,
-      bodyweight   REAL,
-      notes        TEXT NOT NULL DEFAULT '',
-      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS sessions_space_date ON sessions(space_id, date);
-
-    CREATE TABLE IF NOT EXISTS session_exercises (
-      id          INTEGER PRIMARY KEY,
-      session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      exercise_id INTEGER NOT NULL REFERENCES exercises(id),
-      position    INTEGER NOT NULL,
-      rest_sec    INTEGER,
-      notes       TEXT NOT NULL DEFAULT ''
-    );
-    CREATE INDEX IF NOT EXISTS se_session ON session_exercises(session_id);
-    CREATE INDEX IF NOT EXISTS se_exercise ON session_exercises(exercise_id);
-
-    CREATE TABLE IF NOT EXISTS sets (
-      id                  INTEGER PRIMARY KEY,
-      session_exercise_id INTEGER NOT NULL REFERENCES session_exercises(id) ON DELETE CASCADE,
-      position            INTEGER NOT NULL,
-      reps                INTEGER,
-      weight              REAL,
-      rir                 INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS sets_se ON sets(session_exercise_id);
-  `);
+async function openDb({ url = process.env.DATABASE_URL, dir } = {}) {
+  const db = url ? connectPg(url) : await connectPglite(dir);
+  await db.exec(SCHEMA);
+  return db;
 }
 
 function newToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
-function createSpace(db, { token = newToken(), name } = {}) {
-  const tx = db.transaction(() => {
-    const info = db
-      .prepare('INSERT INTO spaces (token, name) VALUES (?, ?)')
-      .run(token, name || 'Mis entrenamientos');
-    const spaceId = info.lastInsertRowid;
-    const insert = db.prepare(
-      'INSERT INTO exercises (space_id, name, muscle, secondary) VALUES (?, ?, ?, ?)'
+async function createSpace(db, { token = newToken(), name } = {}) {
+  return db.tx(async (q) => {
+    const space = await q.one('INSERT INTO spaces (token, name) VALUES ($1, $2) RETURNING *', [
+      token,
+      name || 'Mis entrenamientos',
+    ]);
+    const names = DEFAULT_EXERCISES.map((e) => e[0]);
+    const muscles = DEFAULT_EXERCISES.map((e) => e[1]);
+    const secondary = DEFAULT_EXERCISES.map((e) => (e[2] || []).join(','));
+    await q.query(
+      `INSERT INTO exercises (space_id, name, muscle, secondary)
+       SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[])`,
+      [space.id, names, muscles, secondary]
     );
-    for (const [exName, muscle, secondary = []] of DEFAULT_EXERCISES) {
-      insert.run(spaceId, exName, muscle, secondary.join(','));
-    }
-    return spaceId;
+    return space;
   });
-  const id = tx();
-  return db.prepare('SELECT * FROM spaces WHERE id = ?').get(id);
 }
 
-function findSpaceByToken(db, token) {
+async function findSpaceByToken(db, token) {
   if (typeof token !== 'string' || token.length < 16 || token.length > 128) return null;
-  return db.prepare('SELECT * FROM spaces WHERE token = ?').get(token) || null;
+  return db.one('SELECT * FROM spaces WHERE token = $1', [token]);
 }
 
-module.exports = { openDb, createSpace, findSpaceByToken, newToken };
+// Crea el espacio de ACCESS_TOKEN solo si la base está vacía (primer despliegue).
+// Así, tras "Generar enlace nuevo" el token viejo deja de funcionar y no se recrea.
+async function ensureSpace(db, token) {
+  if (!token) return null;
+  token = token.trim();
+  if (token.length < 16) throw new Error('ACCESS_TOKEN debe tener al menos 16 caracteres.');
+  const existing = await findSpaceByToken(db, token);
+  if (existing) return existing;
+  const { n } = await db.one('SELECT COUNT(*)::int AS n FROM spaces');
+  if (n > 0) return null;
+  try {
+    return await createSpace(db, { token });
+  } catch (e) {
+    if (e.code === '23505') return findSpaceByToken(db, token); // otra instancia lo creó
+    throw e;
+  }
+}
+
+module.exports = { openDb, createSpace, findSpaceByToken, ensureSpace, newToken };

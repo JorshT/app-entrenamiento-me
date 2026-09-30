@@ -81,66 +81,92 @@ function parseSession(body, validExerciseIds) {
 
 // ---------- Acceso a datos ----------
 
-function listExercises(db, spaceId) {
-  return db
-    .prepare(
-      `SELECT e.id, e.name, e.muscle, e.secondary, e.archived,
-              (SELECT COUNT(*) FROM session_exercises se WHERE se.exercise_id = e.id) AS uses
-         FROM exercises e WHERE e.space_id = ? ORDER BY e.name COLLATE NOCASE`
-    )
-    .all(spaceId)
-    .map((e) => ({ ...e, secondary: e.secondary ? e.secondary.split(',') : [], archived: !!e.archived }));
+const isUniqueViolation = (e) => e && e.code === '23505';
+const splitList = (s) => (s ? s.split(',') : []);
+
+async function listExercises(q, spaceId) {
+  const rows = await q.query(
+    `SELECT e.id, e.name, e.muscle, e.secondary, e.archived,
+            (SELECT COUNT(*)::int FROM session_exercises se WHERE se.exercise_id = e.id) AS uses
+       FROM exercises e WHERE e.space_id = $1 ORDER BY lower(e.name)`,
+    [spaceId]
+  );
+  return rows.map((e) => ({ ...e, secondary: splitList(e.secondary) }));
 }
 
-function getSession(db, spaceId, id) {
-  const s = db.prepare('SELECT * FROM sessions WHERE id = ? AND space_id = ?').get(id, spaceId);
+async function getSession(q, spaceId, id) {
+  const s = await q.one('SELECT * FROM sessions WHERE id = $1 AND space_id = $2', [id, spaceId]);
   if (!s) return null;
-  const exercises = db
-    .prepare(
-      `SELECT se.id, se.exercise_id, se.rest_sec, se.notes, e.name, e.muscle, e.secondary
-         FROM session_exercises se JOIN exercises e ON e.id = se.exercise_id
-        WHERE se.session_id = ? ORDER BY se.position`
-    )
-    .all(id);
-  const setsStmt = db.prepare(
-    'SELECT reps, weight, rir FROM sets WHERE session_exercise_id = ? ORDER BY position'
+  const exercises = await q.query(
+    `SELECT se.id, se.exercise_id, se.rest_sec, se.notes, e.name, e.muscle, e.secondary
+       FROM session_exercises se JOIN exercises e ON e.id = se.exercise_id
+      WHERE se.session_id = $1 ORDER BY se.position`,
+    [id]
+  );
+  const sets = await q.query(
+    `SELECT st.session_exercise_id, st.reps, st.weight, st.rir
+       FROM sets st JOIN session_exercises se ON se.id = st.session_exercise_id
+      WHERE se.session_id = $1 ORDER BY st.position`,
+    [id]
   );
   s.exercises = exercises.map((ex) => ({
     exercise_id: ex.exercise_id,
     name: ex.name,
     muscle: ex.muscle,
-    secondary: ex.secondary ? ex.secondary.split(',') : [],
+    secondary: splitList(ex.secondary),
     rest_sec: ex.rest_sec,
     notes: ex.notes,
-    sets: setsStmt.all(ex.id),
+    sets: sets.filter((st) => st.session_exercise_id === ex.id).map(({ session_exercise_id, ...st }) => st),
   }));
   return s;
 }
 
-function writeSessionChildren(db, sessionId, exercises) {
-  db.prepare('DELETE FROM session_exercises WHERE session_id = ?').run(sessionId);
-  const insEx = db.prepare(
-    'INSERT INTO session_exercises (session_id, exercise_id, position, rest_sec, notes) VALUES (?, ?, ?, ?, ?)'
+// Reemplaza ejercicios y series de una sesión (dentro de una transacción).
+async function writeSessionChildren(q, sessionId, exercises) {
+  await q.query('DELETE FROM session_exercises WHERE session_id = $1', [sessionId]);
+  if (!exercises.length) return;
+  const seIds = await q.query(
+    `INSERT INTO session_exercises (session_id, exercise_id, position, rest_sec, notes)
+     SELECT $1, * FROM unnest($2::int[], $3::int[], $4::int[], $5::text[])
+     RETURNING id, position`,
+    [
+      sessionId,
+      exercises.map((e) => e.exercise_id),
+      exercises.map((_, i) => i),
+      exercises.map((e) => e.rest_sec),
+      exercises.map((e) => e.notes),
+    ]
   );
-  const insSet = db.prepare(
-    'INSERT INTO sets (session_exercise_id, position, reps, weight, rir) VALUES (?, ?, ?, ?, ?)'
+  const idByPos = new Map(seIds.map((r) => [r.position, r.id]));
+  const rows = exercises.flatMap((e, i) => e.sets.map((s, j) => [idByPos.get(i), j, s.reps, s.weight, s.rir]));
+  if (!rows.length) return;
+  await q.query(
+    `INSERT INTO sets (session_exercise_id, position, reps, weight, rir)
+     SELECT * FROM unnest($1::int[], $2::int[], $3::int[], $4::float8[], $5::int[])`,
+    [0, 1, 2, 3, 4].map((k) => rows.map((r) => r[k]))
   );
-  exercises.forEach((ex, i) => {
-    const seId = insEx.run(sessionId, ex.exercise_id, i, ex.rest_sec, ex.notes).lastInsertRowid;
-    ex.sets.forEach((s, j) => insSet.run(seId, j, s.reps, s.weight, s.rir));
-  });
 }
 
-function exerciseIdChecker(db, spaceId) {
-  const ids = new Set(
-    db.prepare('SELECT id FROM exercises WHERE space_id = ?').all(spaceId).map((r) => r.id)
+async function exerciseIds(q, spaceId) {
+  const rows = await q.query('SELECT id FROM exercises WHERE space_id = $1', [spaceId]);
+  return new Set(rows.map((r) => r.id));
+}
+
+async function insertSession(q, spaceId, data) {
+  const { id } = await q.one(
+    `INSERT INTO sessions (space_id, date, title, duration_min, rpe, bodyweight, notes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+    [spaceId, data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes]
   );
-  return (id) => ids.has(id);
+  await writeSessionChildren(q, id, data.exercises);
+  return id;
 }
 
 // ---------- App ----------
 
-function createApp(db) {
+// `dbOrGetter` es la base, o una función async que la entrega (en Vercel se conecta en el primer request).
+function createApp(dbOrGetter, { serveStatic = true } = {}) {
+  const getDb = typeof dbOrGetter === 'function' ? dbOrGetter : async () => dbOrGetter;
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '5mb' }));
@@ -155,9 +181,18 @@ function createApp(db) {
 
   const api = express.Router();
 
-  api.use('/s/:token', (req, res, next) => {
-    const space = findSpaceByToken(db, req.params.token);
+  // Mantiene activa la base (Supabase gratis pausa proyectos inactivos). Lo llama el cron de Vercel.
+  api.get('/health', async (req, res) => {
+    const db = await getDb();
+    await db.query('SELECT 1');
+    res.set('Cache-Control', 'no-store').json({ ok: true });
+  });
+
+  api.use('/s/:token', async (req, res, next) => {
+    const db = await getDb();
+    const space = await findSpaceByToken(db, req.params.token);
     if (!space) return res.status(404).json({ error: 'Enlace no válido' });
+    req.db = db;
     req.space = space;
     res.set('Cache-Control', 'no-store');
     next();
@@ -168,106 +203,114 @@ function createApp(db) {
     res.json({ ...rest, muscles: MUSCLES });
   });
 
-  api.patch('/s/:token/me', (req, res) => {
+  api.patch('/s/:token/me', async (req, res) => {
     const name = req.body.name !== undefined ? str(req.body.name, 80, 'name') || 'Mis entrenamientos' : req.space.name;
     const goal = req.body.weekly_goal !== undefined ? optInt(req.body.weekly_goal, 1, 14, 'weekly_goal') : req.space.weekly_goal;
-    db.prepare('UPDATE spaces SET name = ?, weekly_goal = ? WHERE id = ?').run(name, goal || 4, req.space.id);
+    await req.db.query('UPDATE spaces SET name = $1, weekly_goal = $2 WHERE id = $3', [name, goal || 4, req.space.id]);
     res.json({ ok: true });
   });
 
   // Genera un token nuevo e invalida el anterior (por si el enlace se filtró).
-  api.post('/s/:token/rotate', (req, res) => {
+  api.post('/s/:token/rotate', async (req, res) => {
     const token = newToken();
-    db.prepare('UPDATE spaces SET token = ? WHERE id = ?').run(token, req.space.id);
+    await req.db.query('UPDATE spaces SET token = $1 WHERE id = $2', [token, req.space.id]);
     res.json({ token });
   });
 
   // --- Ejercicios ---
-  api.get('/s/:token/exercises', (req, res) => {
-    res.json(listExercises(db, req.space.id));
+  api.get('/s/:token/exercises', async (req, res) => {
+    res.json(await listExercises(req.db, req.space.id));
   });
 
-  api.post('/s/:token/exercises', (req, res) => {
+  api.post('/s/:token/exercises', async (req, res) => {
     const name = str(req.body.name, 80, 'name');
     if (!name) throw new HttpError(400, 'El nombre es obligatorio');
     const muscle = validMuscle(req.body.muscle);
     const secondary = parseSecondary(req.body.secondary);
     try {
-      const info = db
-        .prepare('INSERT INTO exercises (space_id, name, muscle, secondary) VALUES (?, ?, ?, ?)')
-        .run(req.space.id, name, muscle, secondary);
-      res.status(201).json({ id: Number(info.lastInsertRowid), name, muscle, secondary: secondary ? secondary.split(',') : [], archived: false, uses: 0 });
+      const { id } = await req.db.one(
+        'INSERT INTO exercises (space_id, name, muscle, secondary) VALUES ($1, $2, $3, $4) RETURNING id',
+        [req.space.id, name, muscle, secondary]
+      );
+      res.status(201).json({ id, name, muscle, secondary: splitList(secondary), archived: false, uses: 0 });
     } catch (e) {
-      if (String(e.code).startsWith('SQLITE_CONSTRAINT')) throw new HttpError(409, 'Ya existe un ejercicio con ese nombre');
+      if (isUniqueViolation(e)) throw new HttpError(409, 'Ya existe un ejercicio con ese nombre');
       throw e;
     }
   });
 
-  api.patch('/s/:token/exercises/:id', (req, res) => {
-    const ex = db.prepare('SELECT * FROM exercises WHERE id = ? AND space_id = ?').get(req.params.id, req.space.id);
+  const findExercise = async (req) => {
+    const id = optInt(req.params.id, 1, 2147483647, 'id');
+    const ex = await req.db.one('SELECT * FROM exercises WHERE id = $1 AND space_id = $2', [id, req.space.id]);
     if (!ex) throw new HttpError(404, 'Ejercicio no encontrado');
+    return ex;
+  };
+
+  api.patch('/s/:token/exercises/:id', async (req, res) => {
+    const ex = await findExercise(req);
     const name = req.body.name !== undefined ? str(req.body.name, 80, 'name') : ex.name;
     if (!name) throw new HttpError(400, 'El nombre es obligatorio');
     const muscle = req.body.muscle !== undefined ? validMuscle(req.body.muscle) : ex.muscle;
     const secondary = req.body.secondary !== undefined ? parseSecondary(req.body.secondary) : ex.secondary;
-    const archived = req.body.archived !== undefined ? (req.body.archived ? 1 : 0) : ex.archived;
+    const archived = req.body.archived !== undefined ? !!req.body.archived : ex.archived;
     try {
-      db.prepare('UPDATE exercises SET name = ?, muscle = ?, secondary = ?, archived = ? WHERE id = ?').run(
+      await req.db.query('UPDATE exercises SET name = $1, muscle = $2, secondary = $3, archived = $4 WHERE id = $5', [
         name,
         muscle,
         secondary,
         archived,
-        ex.id
-      );
+        ex.id,
+      ]);
     } catch (e) {
-      if (String(e.code).startsWith('SQLITE_CONSTRAINT')) throw new HttpError(409, 'Ya existe un ejercicio con ese nombre');
+      if (isUniqueViolation(e)) throw new HttpError(409, 'Ya existe un ejercicio con ese nombre');
       throw e;
     }
     res.json({ ok: true });
   });
 
-  api.delete('/s/:token/exercises/:id', (req, res) => {
-    const ex = db.prepare('SELECT id FROM exercises WHERE id = ? AND space_id = ?').get(req.params.id, req.space.id);
-    if (!ex) throw new HttpError(404, 'Ejercicio no encontrado');
-    const used = db.prepare('SELECT COUNT(*) AS n FROM session_exercises WHERE exercise_id = ?').get(ex.id).n;
-    if (used) {
+  api.delete('/s/:token/exercises/:id', async (req, res) => {
+    const ex = await findExercise(req);
+    const { n } = await req.db.one('SELECT COUNT(*)::int AS n FROM session_exercises WHERE exercise_id = $1', [ex.id]);
+    if (n) {
       // Si tiene historial no se borra: se archiva para no perder datos.
-      db.prepare('UPDATE exercises SET archived = 1 WHERE id = ?').run(ex.id);
+      await req.db.query('UPDATE exercises SET archived = true WHERE id = $1', [ex.id]);
       return res.json({ archived: true });
     }
-    db.prepare('DELETE FROM exercises WHERE id = ?').run(ex.id);
+    await req.db.query('DELETE FROM exercises WHERE id = $1', [ex.id]);
     res.json({ deleted: true });
   });
 
-  api.get('/s/:token/exercises/:id/history', (req, res) => {
-    const ex = db.prepare('SELECT * FROM exercises WHERE id = ? AND space_id = ?').get(req.params.id, req.space.id);
-    if (!ex) throw new HttpError(404, 'Ejercicio no encontrado');
+  api.get('/s/:token/exercises/:id/history', async (req, res) => {
+    const ex = await findExercise(req);
     const limit = optInt(req.query.limit, 1, 500, 'limit') || 20;
-    const entries = db
-      .prepare(
-        `SELECT se.id, s.id AS session_id, s.date, s.title, se.rest_sec, se.notes
-           FROM session_exercises se JOIN sessions s ON s.id = se.session_id
-          WHERE se.exercise_id = ? AND s.space_id = ?
-          ORDER BY s.date DESC, s.id DESC LIMIT ?`
-      )
-      .all(ex.id, req.space.id, limit);
-    const setsStmt = db.prepare('SELECT reps, weight, rir FROM sets WHERE session_exercise_id = ? ORDER BY position');
+    const entries = await req.db.query(
+      `SELECT se.id, s.id AS session_id, s.date, s.title, se.rest_sec, se.notes
+         FROM session_exercises se JOIN sessions s ON s.id = se.session_id
+        WHERE se.exercise_id = $1 AND s.space_id = $2
+        ORDER BY s.date DESC, s.id DESC LIMIT $3`,
+      [ex.id, req.space.id, limit]
+    );
+    const sets = await req.db.query(
+      `SELECT session_exercise_id, reps, weight, rir FROM sets
+        WHERE session_exercise_id = ANY($1::int[]) ORDER BY position`,
+      [entries.map((e) => e.id)]
+    );
     let bestWeight = 0;
     let bestE1rm = 0;
     const history = entries.map(({ id, ...e }) => {
-      const sets = setsStmt.all(id);
+      const mine = sets.filter((s) => s.session_exercise_id === id).map(({ session_exercise_id, ...s }) => s);
       let top = 0;
       let volume = 0;
-      for (const s of sets) {
+      for (const s of mine) {
         top = Math.max(top, e1rm(s.weight, s.reps));
         volume += (s.reps || 0) * (s.weight || 0);
         bestWeight = Math.max(bestWeight, s.weight || 0);
       }
       bestE1rm = Math.max(bestE1rm, top);
-      return { ...e, sets, e1rm: Math.round(top * 10) / 10, volume: Math.round(volume) };
+      return { ...e, sets: mine, e1rm: Math.round(top * 10) / 10, volume: Math.round(volume) };
     });
     res.json({
-      exercise: { ...ex, secondary: ex.secondary ? ex.secondary.split(',') : [] },
+      exercise: { ...ex, secondary: splitList(ex.secondary) },
       bestWeight,
       bestE1rm: Math.round(bestE1rm * 10) / 10,
       history,
@@ -275,154 +318,152 @@ function createApp(db) {
   });
 
   // --- Sesiones ---
-  api.get('/s/:token/sessions', (req, res) => {
-    const from = D.isIsoDate(req.query.from) ? req.query.from : '0000-01-01';
+  api.get('/s/:token/sessions', async (req, res) => {
+    const from = D.isIsoDate(req.query.from) ? req.query.from : '0001-01-01';
     const to = D.isIsoDate(req.query.to) ? req.query.to : '9999-12-31';
     const limit = optInt(req.query.limit, 1, 1000, 'limit') || 200;
-    const sessions = db
-      .prepare(
-        `SELECT s.id, s.date, s.title, s.duration_min, s.rpe, s.notes,
-                (SELECT COUNT(*) FROM session_exercises se WHERE se.session_id = s.id) AS exercise_count,
-                (SELECT COUNT(*) FROM sets st JOIN session_exercises se ON se.id = st.session_exercise_id
-                  WHERE se.session_id = s.id) AS set_count,
-                (SELECT GROUP_CONCAT(DISTINCT e.muscle) FROM session_exercises se
-                   JOIN exercises e ON e.id = se.exercise_id WHERE se.session_id = s.id) AS muscles
-           FROM sessions s
-          WHERE s.space_id = ? AND s.date BETWEEN ? AND ?
-          ORDER BY s.date DESC, s.id DESC LIMIT ?`
-      )
-      .all(req.space.id, from, to, limit)
-      .map((s) => ({ ...s, muscles: s.muscles ? s.muscles.split(',') : [] }));
-    res.json(sessions);
+    const sessions = await req.db.query(
+      `SELECT s.id, s.date, s.title, s.duration_min, s.rpe, s.notes,
+              (SELECT COUNT(*)::int FROM session_exercises se WHERE se.session_id = s.id) AS exercise_count,
+              (SELECT COUNT(*)::int FROM sets st JOIN session_exercises se ON se.id = st.session_exercise_id
+                WHERE se.session_id = s.id) AS set_count,
+              (SELECT string_agg(DISTINCT e.muscle, ',') FROM session_exercises se
+                 JOIN exercises e ON e.id = se.exercise_id WHERE se.session_id = s.id) AS muscles
+         FROM sessions s
+        WHERE s.space_id = $1 AND s.date BETWEEN $2 AND $3
+        ORDER BY s.date DESC, s.id DESC LIMIT $4`,
+      [req.space.id, from, to, limit]
+    );
+    res.json(sessions.map((s) => ({ ...s, muscles: splitList(s.muscles) })));
   });
 
-  api.get('/s/:token/sessions/:id', (req, res) => {
-    const s = getSession(db, req.space.id, req.params.id);
+  const sessionId = (req) => optInt(req.params.id, 1, 2147483647, 'id');
+
+  api.get('/s/:token/sessions/:id', async (req, res) => {
+    const s = await getSession(req.db, req.space.id, sessionId(req));
     if (!s) throw new HttpError(404, 'Sesión no encontrada');
     res.json(s);
   });
 
-  api.post('/s/:token/sessions', (req, res) => {
-    const data = parseSession(req.body, exerciseIdChecker(db, req.space.id));
-    const id = db.transaction(() => {
-      const sid = db
-        .prepare(
-          `INSERT INTO sessions (space_id, date, title, duration_min, rpe, bodyweight, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
-        )
-        .run(req.space.id, data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes)
-        .lastInsertRowid;
-      writeSessionChildren(db, sid, data.exercises);
-      return sid;
-    })();
-    res.status(201).json(getSession(db, req.space.id, id));
+  api.post('/s/:token/sessions', async (req, res) => {
+    const ids = await exerciseIds(req.db, req.space.id);
+    const data = parseSession(req.body, (id) => ids.has(id));
+    const id = await req.db.tx((q) => insertSession(q, req.space.id, data));
+    res.status(201).json(await getSession(req.db, req.space.id, id));
   });
 
-  api.put('/s/:token/sessions/:id', (req, res) => {
-    const existing = db.prepare('SELECT id FROM sessions WHERE id = ? AND space_id = ?').get(req.params.id, req.space.id);
+  api.put('/s/:token/sessions/:id', async (req, res) => {
+    const id = sessionId(req);
+    const existing = await req.db.one('SELECT id FROM sessions WHERE id = $1 AND space_id = $2', [id, req.space.id]);
     if (!existing) throw new HttpError(404, 'Sesión no encontrada');
-    const data = parseSession(req.body, exerciseIdChecker(db, req.space.id));
-    db.transaction(() => {
-      db.prepare(
-        `UPDATE sessions SET date = ?, title = ?, duration_min = ?, rpe = ?, bodyweight = ?, notes = ?,
-                updated_at = datetime('now') WHERE id = ?`
-      ).run(data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes, existing.id);
-      writeSessionChildren(db, existing.id, data.exercises);
-    })();
-    res.json(getSession(db, req.space.id, existing.id));
+    const ids = await exerciseIds(req.db, req.space.id);
+    const data = parseSession(req.body, (x) => ids.has(x));
+    await req.db.tx(async (q) => {
+      await q.query(
+        `UPDATE sessions SET date = $1, title = $2, duration_min = $3, rpe = $4, bodyweight = $5, notes = $6,
+                updated_at = now() WHERE id = $7`,
+        [data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes, id]
+      );
+      await writeSessionChildren(q, id, data.exercises);
+    });
+    res.json(await getSession(req.db, req.space.id, id));
   });
 
-  api.delete('/s/:token/sessions/:id', (req, res) => {
-    const info = db.prepare('DELETE FROM sessions WHERE id = ? AND space_id = ?').run(req.params.id, req.space.id);
-    if (!info.changes) throw new HttpError(404, 'Sesión no encontrada');
+  api.delete('/s/:token/sessions/:id', async (req, res) => {
+    const rows = await req.db.query('DELETE FROM sessions WHERE id = $1 AND space_id = $2 RETURNING id', [
+      sessionId(req),
+      req.space.id,
+    ]);
+    if (!rows.length) throw new HttpError(404, 'Sesión no encontrada');
     res.json({ deleted: true });
   });
 
   // --- Estadísticas ---
-  api.get('/s/:token/stats', (req, res) => {
+  api.get('/s/:token/stats', async (req, res) => {
     const period = ['week', 'month', 'year'].includes(req.query.period) ? req.query.period : 'week';
-    res.json(computeStats(db, req.space, { period, date: req.query.date, today: req.query.today }));
+    res.json(await computeStats(req.db, req.space, { period, date: req.query.date, today: req.query.today }));
   });
 
-  api.get('/s/:token/bodyweight', (req, res) => {
+  api.get('/s/:token/bodyweight', async (req, res) => {
     res.json(
-      db
-        .prepare('SELECT date, bodyweight FROM sessions WHERE space_id = ? AND bodyweight IS NOT NULL ORDER BY date')
-        .all(req.space.id)
+      await req.db.query(
+        'SELECT date, bodyweight FROM sessions WHERE space_id = $1 AND bodyweight IS NOT NULL ORDER BY date',
+        [req.space.id]
+      )
     );
   });
 
   // --- Respaldo ---
-  api.get('/s/:token/export', (req, res) => {
-    const ids = db.prepare('SELECT id FROM sessions WHERE space_id = ? ORDER BY date, id').all(req.space.id);
-    const payload = {
+  api.get('/s/:token/export', async (req, res) => {
+    const ids = await req.db.query('SELECT id FROM sessions WHERE space_id = $1 ORDER BY date, id', [req.space.id]);
+    const sessions = [];
+    for (const { id } of ids) {
+      const { id: _id, space_id, exercises, ...s } = await getSession(req.db, req.space.id, id);
+      sessions.push({ ...s, exercises: exercises.map(({ exercise_id, muscle, secondary, ...e }) => e) });
+    }
+    res.set('Content-Disposition', `attachment; filename="entrenamientos-${D.todayIso()}.json"`);
+    res.json({
       app: 'app-entrenamiento',
       version: 1,
       exported_at: new Date().toISOString(),
       space: { name: req.space.name, weekly_goal: req.space.weekly_goal },
-      exercises: listExercises(db, req.space.id).map(({ id, uses, ...e }) => e),
-      sessions: ids.map(({ id }) => {
-        const { id: _id, space_id, exercises, ...s } = getSession(db, req.space.id, id);
-        return {
-          ...s,
-          exercises: exercises.map(({ exercise_id, muscle, secondary, ...e }) => e),
-        };
-      }),
-    };
-    res.set('Content-Disposition', `attachment; filename="entrenamientos-${D.todayIso()}.json"`);
-    res.json(payload);
+      exercises: (await listExercises(req.db, req.space.id)).map(({ id, uses, ...e }) => e),
+      sessions,
+    });
   });
 
-  api.post('/s/:token/import', (req, res) => {
+  api.post('/s/:token/import', async (req, res) => {
     const body = req.body || {};
     if (!Array.isArray(body.exercises) || !Array.isArray(body.sessions)) {
       throw new HttpError(400, 'Archivo de respaldo inválido');
     }
     const replace = req.query.mode === 'replace';
     const spaceId = req.space.id;
-    const result = db.transaction(() => {
-      if (replace) db.prepare('DELETE FROM sessions WHERE space_id = ?').run(spaceId);
-      const byName = new Map(listExercises(db, spaceId).map((e) => [e.name.toLowerCase(), e.id]));
-      const insEx = db.prepare('INSERT INTO exercises (space_id, name, muscle, secondary, archived) VALUES (?, ?, ?, ?, ?)');
+    const imported = await req.db.tx(async (q) => {
+      if (replace) await q.query('DELETE FROM sessions WHERE space_id = $1', [spaceId]);
+      const byName = new Map((await listExercises(q, spaceId)).map((e) => [e.name.toLowerCase(), e.id]));
+      const addExercise = async (name, muscle, secondary, archived) => {
+        const { id } = await q.one(
+          'INSERT INTO exercises (space_id, name, muscle, secondary, archived) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+          [spaceId, name, muscle, secondary, archived]
+        );
+        byName.set(name.toLowerCase(), id);
+      };
       for (const e of body.exercises) {
         const name = str(e.name, 80, 'name');
         if (!name || byName.has(name.toLowerCase())) continue;
         const muscle = Object.hasOwn(MUSCLES, e.muscle) ? e.muscle : 'otro';
         const secondary = (Array.isArray(e.secondary) ? e.secondary : []).filter((m) => Object.hasOwn(MUSCLES, m)).join(',');
-        byName.set(name.toLowerCase(), Number(insEx.run(spaceId, name, muscle, secondary, e.archived ? 1 : 0).lastInsertRowid));
+        await addExercise(name, muscle, secondary, !!e.archived);
       }
-      const insSession = db.prepare(
-        `INSERT INTO sessions (space_id, date, title, duration_min, rpe, bodyweight, notes) VALUES (?, ?, ?, ?, ?, ?, ?)`
-      );
       let count = 0;
       for (const s of body.sessions) {
-        const exercises = (Array.isArray(s.exercises) ? s.exercises : []).map((e) => {
-          const key = String(e.name || '').trim().toLowerCase();
-          if (!byName.has(key)) {
-            byName.set(key, Number(insEx.run(spaceId, String(e.name).trim().slice(0, 80), 'otro', '', 0).lastInsertRowid));
-          }
-          return { ...e, exercise_id: byName.get(key) };
-        });
-        const validIds = new Set(byName.values());
-        const data = parseSession({ ...s, exercises }, (id) => validIds.has(id));
-        const sid = insSession.run(spaceId, data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes).lastInsertRowid;
-        writeSessionChildren(db, sid, data.exercises);
+        const exercises = [];
+        for (const e of Array.isArray(s.exercises) ? s.exercises : []) {
+          const name = str(String(e.name || ''), 80, 'name');
+          if (!name) throw new HttpError(400, 'Ejercicio sin nombre en el respaldo');
+          if (!byName.has(name.toLowerCase())) await addExercise(name, 'otro', '', false);
+          exercises.push({ ...e, exercise_id: byName.get(name.toLowerCase()) });
+        }
+        const valid = new Set(byName.values());
+        await insertSession(q, spaceId, parseSession({ ...s, exercises }, (id) => valid.has(id)));
         count += 1;
       }
       return count;
-    })();
-    res.json({ imported: result });
+    });
+    res.json({ imported });
   });
 
   app.use('/api', api);
   app.use('/api', (req, res) => res.status(404).json({ error: 'No encontrado' }));
 
-  // --- Frontend ---
-  const publicDir = path.join(__dirname, '..', 'public');
-  app.use('/vendor/chart.js', express.static(path.join(require.resolve('chart.js'), '..', '..', 'dist')));
-  app.use(express.static(publicDir, { index: false }));
-  // /t/<token> y cualquier otra ruta sirven la SPA; el frontend lee el token de la URL.
-  app.get(['/', '/t/:token'], (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+  // --- Frontend (en Vercel lo sirve su CDN; aquí es para uso local) ---
+  if (serveStatic) {
+    const publicDir = path.join(__dirname, '..', 'public');
+    app.use(express.static(publicDir, { index: false }));
+    // /t/<token> sirve la SPA; el frontend lee el token de la URL.
+    app.get(['/', '/t/:token'], (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+  }
 
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {

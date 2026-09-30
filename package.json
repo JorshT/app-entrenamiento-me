@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "new-link": "node scripts/new-link.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "vendor": "cp node_modules/chart.js/dist/chart.umd.min.js public/vendor/"
   },
   "repository": {
     "type": "git",
@@ -18,12 +19,15 @@
   },
   "homepage": "https://github.com/JorshT/app-entrenamiento-me#readme",
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
-    "chart.js": "^4.5.1",
-    "express": "^5.2.1"
+    "@electric-sql/pglite": "^0.5.8",
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
   },
   "private": true,
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
+  },
+  "devDependencies": {
+    "chart.js": "^4.5.1"
   }
 }

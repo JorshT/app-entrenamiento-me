@@ -168,14 +168,16 @@ textarea { min-height: 70px; resize: vertical; }
 .heat { display: grid; gap: 3px; }
 .heat.cal { grid-template-columns: repeat(7, 1fr); }
 .heat.cal .d { aspect-ratio: 1; border-radius: 6px; background: var(--surface-2); display: grid; place-items: center; font-size: .75rem; color: var(--muted); }
-.heat .d.l1 { background: color-mix(in srgb, var(--accent) 35%, var(--surface-2)); color: var(--text); }
-.heat .d.l2 { background: color-mix(in srgb, var(--accent) 65%, var(--surface-2)); color: var(--accent-ink); }
-.heat .d.l3 { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+
 .heat .d.out { visibility: hidden; }
 .heat .d.today { outline: 2px solid var(--text); outline-offset: -2px; }
 .heat .h { font-size: .7rem; color: var(--muted); text-align: center; }
 .heat.year { grid-auto-flow: column; grid-template-rows: repeat(7, 1fr); grid-auto-columns: 1fr; overflow-x: auto; }
 .heat.year .d { aspect-ratio: 1; border-radius: 2px; background: var(--surface-2); min-width: 8px; }
+/* Niveles después de los fondos base para que siempre ganen. */
+.heat .d.l1 { background: color-mix(in srgb, var(--accent) 35%, var(--surface-2)); color: var(--text); }
+.heat .d.l2 { background: color-mix(in srgb, var(--accent) 65%, var(--surface-2)); color: var(--accent-ink); }
+.heat .d.l3 { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
 
 table.list { width: 100%; border-collapse: collapse; font-size: .88rem; }
 table.list th { text-align: left; font-weight: 500; color: var(--muted); font-size: .75rem; padding: 6px 4px; border-bottom: 1px solid var(--border); }

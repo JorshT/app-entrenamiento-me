@@ -18,8 +18,7 @@ function splitSecondary(s) {
 
 // Carga todas las series (una fila por serie; ejercicios sin series dan una fila con set_id null).
 function loadRows(db, spaceId, from, to) {
-  return db
-    .prepare(
+  return db.query(
       `SELECT s.id AS session_id, s.date, s.duration_min, s.rpe,
               se.id AS se_id, e.id AS exercise_id, e.name AS exercise, e.muscle, e.secondary,
               st.id AS set_id, st.reps, st.weight
@@ -27,10 +26,10 @@ function loadRows(db, spaceId, from, to) {
          LEFT JOIN session_exercises se ON se.session_id = s.id
          LEFT JOIN exercises e ON e.id = se.exercise_id
          LEFT JOIN sets st ON st.session_exercise_id = se.id
-        WHERE s.space_id = ? AND s.date BETWEEN ? AND ?
-        ORDER BY s.date, s.id, se.position, st.position`
-    )
-    .all(spaceId, from, to);
+        WHERE s.space_id = $1 AND s.date BETWEEN $2 AND $3
+        ORDER BY s.date, s.id, se.position, st.position`,
+      [spaceId, from, to]
+    );
 }
 
 function emptyTotals() {
@@ -116,13 +115,9 @@ function elapsedWeeks(from, to, today) {
   return Math.max(1, (D.diffDays(from, end) + 1) / 7);
 }
 
-function weekStreak(db, spaceId, today) {
-  const weeks = new Set(
-    db
-      .prepare('SELECT DISTINCT date FROM sessions WHERE space_id = ?')
-      .all(spaceId)
-      .map((r) => D.startOfWeek(r.date))
-  );
+async function weekStreak(db, spaceId, today) {
+  const rows = await db.query('SELECT DISTINCT date FROM sessions WHERE space_id = $1', [spaceId]);
+  const weeks = new Set(rows.map((r) => D.startOfWeek(r.date)));
   let w = D.startOfWeek(today);
   // Si esta semana aún no entrenas, la racha se cuenta desde la semana pasada.
   if (!weeks.has(w)) w = D.addDays(w, -7);
@@ -134,23 +129,21 @@ function weekStreak(db, spaceId, today) {
   return streak;
 }
 
-function allTime(db, spaceId, today) {
-  const row = db
-    .prepare(
-      `SELECT MIN(date) AS first, MAX(date) AS last, COUNT(*) AS sessions,
-              COALESCE(SUM(duration_min), 0) AS minutes
-         FROM sessions WHERE space_id = ?`
-    )
-    .get(spaceId);
-  const sets = db
-    .prepare(
-      `SELECT COUNT(st.id) AS sets, COALESCE(SUM(st.reps * st.weight), 0) AS volume
-         FROM sets st
-         JOIN session_exercises se ON se.id = st.session_exercise_id
-         JOIN sessions s ON s.id = se.session_id
-        WHERE s.space_id = ?`
-    )
-    .get(spaceId);
+async function allTime(db, spaceId, today) {
+  const row = await db.one(
+    `SELECT MIN(date)::text AS first, MAX(date)::text AS last, COUNT(*)::int AS sessions,
+            COALESCE(SUM(duration_min), 0)::int AS minutes
+       FROM sessions WHERE space_id = $1`,
+    [spaceId]
+  );
+  const sets = await db.one(
+    `SELECT COUNT(st.id)::int AS sets, COALESCE(SUM(st.reps * st.weight), 0)::float8 AS volume
+       FROM sets st
+       JOIN session_exercises se ON se.id = st.session_exercise_id
+       JOIN sessions s ON s.id = se.session_id
+      WHERE s.space_id = $1`,
+    [spaceId]
+  );
   return {
     first: row.first,
     last: row.last,
@@ -160,21 +153,20 @@ function allTime(db, spaceId, today) {
     volume: Math.round(sets.volume),
     daysSinceFirst: row.first ? D.diffDays(row.first, today) + 1 : 0,
     daysSinceLast: row.last ? D.diffDays(row.last, today) : null,
-    weekStreak: weekStreak(db, spaceId, today),
+    weekStreak: await weekStreak(db, spaceId, today),
   };
 }
 
 // Mejores marcas previas al período, por ejercicio.
-function bestBefore(db, spaceId, before) {
-  const rows = db
-    .prepare(
+async function bestBefore(db, spaceId, before) {
+  const rows = await db.query(
       `SELECT se.exercise_id, st.reps, st.weight
          FROM sets st
          JOIN session_exercises se ON se.id = st.session_exercise_id
          JOIN sessions s ON s.id = se.session_id
-        WHERE s.space_id = ? AND s.date < ? AND st.weight > 0 AND st.reps > 0`
-    )
-    .all(spaceId, before);
+        WHERE s.space_id = $1 AND s.date < $2 AND st.weight > 0 AND st.reps > 0`,
+      [spaceId, before]
+    );
   const best = new Map();
   for (const r of rows) {
     const b = best.get(r.exercise_id) || { weight: 0, e1rm: 0 };
@@ -185,15 +177,15 @@ function bestBefore(db, spaceId, before) {
   return best;
 }
 
-function computeStats(db, space, { period = 'week', date, today }) {
+async function computeStats(db, space, { period = 'week', date, today }) {
   today = D.isIsoDate(today) ? today : D.todayIso();
   date = D.isIsoDate(date) ? date : today;
   const { from, to } = D.periodRange(period, date);
   const prev = D.periodRange(period, D.shiftPeriod(period, date, -1));
 
-  const rows = loadRows(db, space.id, from, to);
+  const rows = await loadRows(db, space.id, from, to);
   const totals = computeTotals(rows);
-  const previous = computeTotals(loadRows(db, space.id, prev.from, prev.to));
+  const previous = computeTotals(await loadRows(db, space.id, prev.from, prev.to));
   const weeks = elapsedWeeks(from, to, today);
 
   const buckets = buildBuckets(period, from, to);
@@ -261,7 +253,7 @@ function computeStats(db, space, { period = 'week', date, today }) {
     }))
     .sort((a, b) => b.effective - a.effective);
 
-  const before = bestBefore(db, space.id, from);
+  const before = await bestBefore(db, space.id, from);
   const exerciseList = [...exercises.values()].map((e) => ({
     ...e,
     sessions: e.sessions.size,
@@ -310,7 +302,7 @@ function computeStats(db, space, { period = 'week', date, today }) {
     trainedDays,
     topExercises: exerciseList.sort((a, b) => b.sets - a.sets).slice(0, 10),
     records,
-    allTime: allTime(db, space.id, today),
+    allTime: await allTime(db, space.id, today),
   };
 }
 

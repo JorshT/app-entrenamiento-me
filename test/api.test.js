@@ -2,13 +2,18 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { openDb, createSpace } = require('../src/db');
+const { openDb, createSpace, ensureSpace } = require('../src/db');
 const { createApp } = require('../src/app');
 
-function setup() {
-  const db = openDb(':memory:');
-  const space = createSpace(db);
+// Con TEST_DATABASE_URL las pruebas corren contra un Postgres real; si no, contra PGlite en memoria.
+async function setup(t) {
+  const db = await openDb({ url: process.env.TEST_DATABASE_URL || '' });
+  const space = await createSpace(db);
   const server = createApp(db).listen(0);
+  t.after(async () => {
+    server.close();
+    await db.close();
+  });
   const base = `http://127.0.0.1:${server.address().port}`;
   const api = async (method, path, body, token = space.token) => {
     const res = await fetch(`${base}/api/s/${token}${path}`, {
@@ -22,15 +27,16 @@ function setup() {
 }
 
 test('rechaza tokens inválidos', async (t) => {
-  const { server, api } = setup();
-  t.after(() => server.close());
+  const { api } = await setup(t);
   const r = await api('GET', '/me', null, 'x'.repeat(32));
   assert.equal(r.status, 404);
 });
 
 test('flujo completo: sesión, historial y estadísticas', async (t) => {
-  const { server, api, base, space } = setup();
-  t.after(() => server.close());
+  const { api, base, space } = await setup(t);
+
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
 
   const page = await fetch(`${base}/t/${space.token}`);
   assert.equal(page.status, 200);
@@ -113,12 +119,23 @@ test('flujo completo: sesión, historial y estadísticas', async (t) => {
 });
 
 test('los espacios están aislados entre sí', async (t) => {
-  const { server, api, db } = setup();
-  t.after(() => server.close());
-  const other = createSpace(db);
+  const { api, db } = await setup(t);
+  const other = await createSpace(db);
   const ex = (await api('GET', '/exercises')).body[0];
   const s = (await api('POST', '/sessions', { date: '2026-09-30', exercises: [{ exercise_id: ex.id, sets: [{ reps: 1 }] }] })).body;
   assert.equal((await api('GET', `/sessions/${s.id}`, null, other.token)).status, 404);
   const cross = await api('POST', '/sessions', { date: '2026-09-30', exercises: [{ exercise_id: ex.id, sets: [] }] }, other.token);
   assert.equal(cross.status, 400);
+});
+
+test('ACCESS_TOKEN solo crea el espacio si la base está vacía', async () => {
+  const db = await openDb({ url: '' });
+  const token = 'token-de-prueba-123456789';
+  const first = await ensureSpace(db, token);
+  assert.equal(first.token, token);
+  assert.equal((await ensureSpace(db, token)).id, first.id);
+  await db.query('UPDATE spaces SET token = $1 WHERE id = $2', ['otro-token-rotado-123456789', first.id]);
+  assert.equal(await ensureSpace(db, token), null);
+  assert.equal((await db.one('SELECT COUNT(*)::int AS n FROM spaces')).n, 1);
+  await db.close();
 });
