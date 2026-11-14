@@ -307,7 +307,7 @@ table.list a { text-decoration: none; }
 .user-card.disabled .user-main { opacity: .6; }
 .user-main { flex: 1 1 220px; min-width: 0; }
 .user-name { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 2px; }
-.user-actions { display: flex; gap: 6px; align-items: center; }
+.user-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
 .user-name .chip.live { margin-left: 0; }
 
@@ -371,3 +371,20 @@ body.timer-on .view { padding-top: 76px; }
 .card > h2 { flex-wrap: wrap; }
 .card > h2 .segmented button { padding: 4px 10px; font-size: .8rem; }
 input[type="date"] { min-width: 0; -webkit-appearance: none; appearance: none; }
+
+/* ---------- Administrador viendo a otro usuario (solo lectura) ---------- */
+.viewas-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px max(16px, calc((100% - 1100px) / 2 + 16px)); font-size: .9rem;
+  background: color-mix(in srgb, var(--warn) 16%, var(--bg)); border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.viewas-bar span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.viewas-bar[hidden] { display: none; }
+body.viewing-as .nav-add { display: none; }
+body.viewing-as .nav { grid-template-columns: repeat(4, 1fr); }
+.sets.read td { padding: 6px 3px; border-top: 1px solid var(--border); }
+.sets.read td:last-child { width: auto; }
+.ex-notes { margin-top: 10px; display: grid; gap: 4px; }
+.note { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ex-head .name a { color: inherit; text-decoration: none; }
+.ex-head .beat { white-space: nowrap; }

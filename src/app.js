@@ -291,8 +291,25 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     res.json({ deleted: true });
   });
 
+  // Datos básicos de un usuario (para la vista "ver entrenamientos").
+  api.get('/s/:token/admin/users/:id', async (req, res) => {
+    const { id } = await findUser(req);
+    res.json(await req.db.one('SELECT id, name, weekly_goal, is_admin, disabled, created_at FROM spaces WHERE id = $1', [id]));
+  });
+
+  // --- Rutas de lectura: las usa cada usuario con sus datos y el administrador para ver los de otro ---
+  // El administrador accede en solo lectura vía /s/<su token>/admin/users/<id>/as/... : solo hay GET,
+  // así que cualquier intento de escribir en los datos de otro termina en 404.
+  const read = express.Router();
+
+  api.use('/s/:token/admin/users/:id/as', async (req, res, next) => {
+    const { id } = await findUser(req);
+    req.space = await req.db.one('SELECT * FROM spaces WHERE id = $1', [id]);
+    next();
+  }, read);
+
   // --- Ejercicios ---
-  api.get('/s/:token/exercises', async (req, res) => {
+  read.get('/exercises', async (req, res) => {
     res.json(await listExercises(req.db, req.space.id));
   });
 
@@ -354,15 +371,21 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     res.json({ deleted: true });
   });
 
-  api.get('/s/:token/exercises/:id/history', async (req, res) => {
+  read.get('/exercises/:id/history', async (req, res) => {
     const ex = await findExercise(req);
     const limit = optInt(req.query.limit, 1, 500, 'limit') || 20;
+    // ?before=<id de sesión>: solo lo anterior a esa sesión (para comparar con "la vez anterior").
+    const beforeId = optInt(req.query.before, 1, 2147483647, 'before');
+    const before = beforeId
+      ? await req.db.one('SELECT date, id FROM sessions WHERE id = $1 AND space_id = $2', [beforeId, req.space.id])
+      : null;
     const entries = await req.db.query(
       `SELECT se.id, s.id AS session_id, s.date, s.title, se.rest_sec, se.notes
          FROM session_exercises se JOIN sessions s ON s.id = se.session_id
         WHERE se.exercise_id = $1 AND s.space_id = $2
+          AND ($4::date IS NULL OR (s.date, s.id) < ($4::date, $5::int))
         ORDER BY s.date DESC, s.id DESC LIMIT $3`,
-      [ex.id, req.space.id, limit]
+      [ex.id, req.space.id, limit, before ? before.date : null, before ? before.id : null]
     );
     const sets = await req.db.query(
       `SELECT session_exercise_id, reps, weight, rir FROM sets
@@ -392,7 +415,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
   });
 
   // --- Sesiones ---
-  api.get('/s/:token/sessions', async (req, res) => {
+  read.get('/sessions', async (req, res) => {
     const from = D.isIsoDate(req.query.from) ? req.query.from : '0001-01-01';
     const to = D.isIsoDate(req.query.to) ? req.query.to : '9999-12-31';
     const limit = optInt(req.query.limit, 1, 1000, 'limit') || 200;
@@ -414,7 +437,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
   const sessionId = (req) => optInt(req.params.id, 1, 2147483647, 'id');
 
   // Sesión que se está registrando en vivo (la más reciente), o null.
-  api.get('/s/:token/sessions/active', async (req, res) => {
+  read.get('/sessions/active', async (req, res) => {
     const row = await req.db.one(
       'SELECT id FROM sessions WHERE space_id = $1 AND in_progress ORDER BY created_at DESC, id DESC LIMIT 1',
       [req.space.id]
@@ -422,7 +445,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     res.json(row ? await getSession(req.db, req.space.id, row.id) : null);
   });
 
-  api.get('/s/:token/sessions/:id', async (req, res) => {
+  read.get('/sessions/:id', async (req, res) => {
     const s = await getSession(req.db, req.space.id, sessionId(req));
     if (!s) throw new HttpError(404, 'Sesión no encontrada');
     res.json(s);
@@ -462,12 +485,12 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
   });
 
   // --- Estadísticas ---
-  api.get('/s/:token/stats', async (req, res) => {
+  read.get('/stats', async (req, res) => {
     const period = ['week', 'month', 'year'].includes(req.query.period) ? req.query.period : 'week';
     res.json(await computeStats(req.db, req.space, { period, date: req.query.date, today: req.query.today }));
   });
 
-  api.get('/s/:token/bodyweight', async (req, res) => {
+  read.get('/bodyweight', async (req, res) => {
     res.json(
       await req.db.query(
         'SELECT date, bodyweight FROM sessions WHERE space_id = $1 AND bodyweight IS NOT NULL ORDER BY date',
@@ -536,6 +559,9 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     });
     res.json({ imported });
   });
+
+  // Lectura de los datos propios (después de las rutas de administración, que tienen prioridad).
+  api.use('/s/:token', read);
 
   app.use('/api', api);
   app.use('/api', (req, res) => res.status(404).json({ error: 'No encontrado' }));

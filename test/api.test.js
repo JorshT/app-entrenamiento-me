@@ -200,6 +200,52 @@ test('administración de usuarios: crear, enlace nuevo, suspender y eliminar', a
   assert.deepEqual(left, { s: 0, e: 0 });
 });
 
+test('el administrador ve los entrenamientos de otro usuario (solo lectura)', async (t) => {
+  const { api } = await setup(t);
+  const ana = (await api('POST', '/admin/users', { name: 'Ana' })).body;
+  const asAna = (method, path, body) => api(method, path, body, ana.token);
+  const bench = (await asAna('GET', '/exercises')).body.find((e) => e.name === 'Press banca');
+  const first = (await asAna('POST', '/sessions', {
+    date: '2026-09-22', exercises: [{ exercise_id: bench.id, sets: [{ reps: 8, weight: 30 }] }],
+  })).body;
+  const second = (await asAna('POST', '/sessions', {
+    date: '2026-09-29', title: 'Torso', rpe: 7, notes: 'Me sentí bien',
+    exercises: [{ exercise_id: bench.id, notes: 'Agarre cerrado', sets: [{ reps: 8, weight: 32.5, rir: 2 }] }],
+  })).body;
+
+  const as = (path) => api('GET', `/admin/users/${ana.id}/as${path}`);
+  assert.equal((await api('GET', `/admin/users/${ana.id}`)).body.name, 'Ana');
+  const list = (await as('/sessions')).body;
+  assert.deepEqual(list.map((s) => s.id), [second.id, first.id]);
+  const detail = (await as(`/sessions/${second.id}`)).body;
+  assert.equal(detail.notes, 'Me sentí bien');
+  assert.equal(detail.exercises[0].notes, 'Agarre cerrado');
+  assert.deepEqual(detail.exercises[0].sets, [{ reps: 8, weight: 32.5, rir: 2 }]);
+  assert.equal((await as('/exercises')).body.find((e) => e.id === bench.id).uses, 2);
+  assert.equal((await as(`/stats?period=week&date=2026-09-29`)).body.totals.sessions, 1);
+
+  // "La vez anterior" a la sesión del 29 es la del 22.
+  const prev = (await as(`/exercises/${bench.id}/history?limit=1&before=${second.id}`)).body.history;
+  assert.deepEqual(prev.map((h) => h.session_id), [first.id]);
+
+  // Solo lectura: no puede crear, editar ni borrar en los datos de Ana.
+  const base = `/admin/users/${ana.id}/as`;
+  assert.equal((await api('PUT', `${base}/sessions/${second.id}`, { date: '2026-09-29', exercises: [] })).status, 404);
+  assert.equal((await api('DELETE', `${base}/sessions/${second.id}`)).status, 404);
+  assert.equal((await api('POST', `${base}/sessions`, { date: '2026-09-29', exercises: [] })).status, 404);
+  assert.equal((await asAna('GET', `/sessions/${second.id}`)).body.exercises.length, 1);
+
+  // Las sesiones de Ana no se ven como propias del administrador.
+  assert.equal((await api('GET', `/sessions/${second.id}`)).status, 404);
+  // Un usuario normal no puede ver a otros.
+  const me = (await api('GET', '/me')).body;
+  const adminId = (await api('GET', '/admin/users')).body.find((u) => u.is_admin).id;
+  assert.ok(me.is_admin);
+  assert.equal((await asAna('GET', `/admin/users/${adminId}/as/sessions`)).status, 403);
+  assert.equal((await as('/exercises/999999/history')).status, 404);
+  assert.equal((await api('GET', '/admin/users/999999/as/sessions')).status, 404);
+});
+
 test('los espacios están aislados entre sí', async (t) => {
   const { api, db } = await setup(t);
   const other = await createSpace(db);

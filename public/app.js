@@ -119,9 +119,9 @@
   }
 
   const liveBanner = (s) => (s ? `
-    <a class="live-banner" href="#/en-vivo/${s.id}">
-      <span><i class="dot"></i>Entrenamiento en curso${s.title ? ` · ${esc(s.title)}` : ''}</span>
-      <strong>Continuar →</strong>
+    <a class="live-banner" href="${L(`#/en-vivo/${s.id}`)}">
+      <span><i class="dot"></i>${ro() ? 'Entrenando ahora' : 'Entrenamiento en curso'}${s.title ? ` · ${esc(s.title)}` : ''}</span>
+      <strong>${ro() ? 'Ver →' : 'Continuar →'}</strong>
     </a>` : '');
 
   // ================= Token / acceso =================
@@ -157,7 +157,14 @@
   }
 
   // ================= API =================
+  // Cuando el administrador está viendo a otro usuario, las lecturas de datos van a los de esa persona
+  // (en solo lectura: el servidor no expone escrituras por esa ruta).
+  const READ_PATH = /^\/(exercises|sessions|stats|bodyweight)(\/|\?|$)/;
   async function api(method, path, body) {
+    if (state.viewAs && READ_PATH.test(path)) {
+      if (method !== 'GET') throw new Error('Estás viendo los datos de otra persona (solo lectura)');
+      path = `/admin/users/${state.viewAs.id}/as${path}`;
+    }
     const res = await fetch(`/api/s/${token}${path}`, {
       method,
       headers: body ? { 'Content-Type': 'application/json' } : {},
@@ -185,7 +192,13 @@
     charts: [],
     dirty: false,
     lastHash: location.hash,
+    viewAs: null, // { id, name, … } cuando el administrador ve los entrenamientos de otro usuario
+    cleanup: null, // se ejecuta al cambiar de vista (p. ej. detener una actualización periódica)
   };
+
+  // Enlace interno: en modo "ver a otro usuario" se antepone #/u/<id>.
+  const L = (hash) => (state.viewAs ? `#/u/${state.viewAs.id}${hash.slice(1)}` : hash);
+  const ro = () => !!state.viewAs; // solo lectura
 
   const MUSCLE_COLORS = {
     pecho: '#f97316', espalda: '#3b82f6', hombros: '#a855f7', trapecio: '#8b5cf6', biceps: '#ec4899',
@@ -276,6 +289,41 @@
     [/^#\/usuarios$/, () => viewUsers()],
   ];
 
+  // Lo que el administrador puede ver de otro usuario (todo en solo lectura).
+  const viewAsRoutes = [
+    [/^#\/resumen$/, () => viewSummary()],
+    [/^#\/sesiones$/, () => viewSessions()],
+    [/^#\/(?:sesion|en-vivo)\/(\d+)$/, (m) => viewSessionDetail(Number(m[1]))],
+    [/^#\/ejercicios$/, () => viewExercises()],
+    [/^#\/ejercicio\/(\d+)$/, (m) => viewExercise(Number(m[1]))],
+  ];
+
+  // Entra o sale del modo "ver a otro usuario": carga sus datos básicos y su catálogo de ejercicios,
+  // y ajusta la barra superior y la navegación.
+  async function setViewAs(id) {
+    const current = state.viewAs ? state.viewAs.id : null;
+    if (id === current) return;
+    if (id) {
+      const user = await api('GET', `/admin/users/${id}`);
+      state.viewAs = user;
+    } else {
+      state.viewAs = null;
+    }
+    await loadExercises();
+    const bar = $('#viewas');
+    bar.hidden = !state.viewAs;
+    document.body.classList.toggle('viewing-as', !!state.viewAs);
+    if (state.viewAs) {
+      bar.innerHTML = `<span>👁 Viendo a <strong>${esc(state.viewAs.name)}</strong> · solo lectura</span>
+        <a class="btn ghost small" href="#/usuarios">Salir</a>`;
+    }
+    $$('#nav a').forEach((a) => {
+      a.dataset.base ||= a.getAttribute('href');
+      a.setAttribute('href', a.dataset.route === 'ajustes' ? a.dataset.base : L(a.dataset.base));
+    });
+    $('.brand').setAttribute('href', L('#/resumen'));
+  }
+
   let skipNextHash = false;
   async function route() {
     if (skipNextHash) { skipNextHash = false; return; }
@@ -286,17 +334,31 @@
     }
     state.dirty = false;
     state.lastHash = location.hash;
-    const hash = location.hash || '#/resumen';
+    if (state.cleanup) { state.cleanup(); state.cleanup = null; }
     state.charts.forEach((c) => c.destroy());
     state.charts = [];
-    const found = routes.find(([re]) => re.test(hash));
-    if (!found) { location.replace('#/resumen'); return; }
-    const section = { 'en-vivo': 'sesion', usuarios: 'ajustes' }[hash.split(/[/?]/)[1]] || hash.split(/[/?]/)[1];
     state.onOnline = null;
-    $$('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === section));
+
+    // #/u/<id>/… = el administrador viendo los entrenamientos de otro usuario.
+    const fullHash = location.hash || '#/resumen';
+    const asMatch = fullHash.match(/^#\/u\/(\d+)(\/.*)?$/);
+    const hash = asMatch ? `#${asMatch[2] || '/resumen'}` : fullHash;
+    let found;
+    if (asMatch) {
+      if (!state.me.is_admin) { location.replace('#/resumen'); return; }
+      found = viewAsRoutes.find(([re]) => re.test(hash));
+      if (!found) { location.replace(`#/u/${asMatch[1]}/resumen`); return; }
+    } else {
+      found = routes.find(([re]) => re.test(hash));
+      if (!found) { location.replace('#/resumen'); return; }
+    }
+    const section = { 'en-vivo': asMatch ? 'sesiones' : 'sesion', usuarios: 'ajustes' }[hash.split(/[/?]/)[1]]
+      || (asMatch && hash.startsWith('#/sesion/') ? 'sesiones' : hash.split(/[/?]/)[1]);
     view.innerHTML = '<p class="muted">Cargando…</p>';
     window.scrollTo(0, 0);
     try {
+      await setViewAs(asMatch ? Number(asMatch[1]) : null);
+      $$('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.route === section));
       await found[1](hash.match(found[0]));
     } catch (err) {
       console.error(err);
@@ -485,7 +547,7 @@
   }
 
   function renderAllTime(a) {
-    if (!a.sessions) return '<p class="muted">Registra tu primera sesión para ver tu historial.</p>';
+    if (!a.sessions) return `<p class="muted">${ro() ? 'Todavía no registra sesiones.' : 'Registra tu primera sesión para ver tu historial.'}</p>`;
     const last = a.daysSinceLast === 0 ? 'hoy' : a.daysSinceLast === 1 ? 'ayer' : `hace ${a.daysSinceLast} días`;
     return `
       <p style="margin-top:0">Entrenando desde el <strong>${fmtDate(a.first, { day: 'numeric', month: 'long', year: 'numeric' })}</strong>
@@ -506,7 +568,7 @@
     return `<div class="table-wrap"><table class="list">
       <thead><tr><th>Ejercicio</th><th class="n">Series</th><th class="n">Reps</th><th class="n">Máx.</th><th class="n">1RM est.</th></tr></thead>
       <tbody>${list.map((e) => `<tr>
-        <td><a href="#/ejercicio/${e.id}">${esc(e.name)}</a><br><span class="chip">${esc(muscleLabel(e.muscle))}</span></td>
+        <td><a href="${L(`#/ejercicio/${e.id}`)}">${esc(e.name)}</a><br><span class="chip">${esc(muscleLabel(e.muscle))}</span></td>
         <td class="n">${e.sets}</td><td class="n">${fmtNum(e.reps)}</td>
         <td class="n">${e.bestWeight ? `${fmtNum(e.bestWeight, 2)} kg` : '—'}</td>
         <td class="n">${e.bestE1rm ? `${fmtNum(e.bestE1rm, 1)} kg` : '—'}</td></tr>`).join('')}</tbody></table></div>`;
@@ -517,7 +579,7 @@
     return `<div class="table-wrap"><table class="list">
       <thead><tr><th>Ejercicio</th><th class="n">Peso máx.</th><th class="n">1RM est.</th></tr></thead>
       <tbody>${list.map((r) => `<tr>
-        <td><a href="#/ejercicio/${r.id}">🏆 ${esc(r.name)}</a></td>
+        <td><a href="${L(`#/ejercicio/${r.id}`)}">🏆 ${esc(r.name)}</a></td>
         <td class="n">${fmtNum(r.weight, 2)} kg<br><span class="muted small">antes ${fmtNum(r.prevWeight, 2)}</span></td>
         <td class="n">${fmtNum(r.e1rm, 1)} kg<br><span class="muted small">antes ${fmtNum(r.prevE1rm, 1)}</span></td></tr>`).join('')}</tbody></table></div>`;
   }
@@ -616,8 +678,8 @@
             </header>
             ${items.map(sessionItem).join('')}
           </section>`).join('')
-        : `<div class="empty"><p>${muscle ? 'No hay sesiones con ese grupo muscular.' : 'Todavía no registras ninguna sesión.'}</p>
-            <a class="btn" href="#/sesion/nueva">Registrar sesión</a></div>`;
+        : `<div class="empty"><p>${muscle ? 'No hay sesiones con ese grupo muscular.' : ro() ? 'Todavía no registra ninguna sesión.' : 'Todavía no registras ninguna sesión.'}</p>
+            ${ro() ? '' : '<a class="btn" href="#/sesion/nueva">Registrar sesión</a>'}</div>`;
     };
 
     view.innerHTML = `
@@ -628,8 +690,8 @@
             <option value="">Todos los grupos</option>
             ${Object.entries(state.muscles).map(([k, v]) => `<option value="${k}" ${k === filterMuscle ? 'selected' : ''}>${esc(v)}</option>`).join('')}
           </select>
-          <a class="btn ghost" href="#/sesion/manual">Registrar pasada</a>
-          <a class="btn" href="#/sesion/nueva">+ Nueva</a>
+          ${ro() ? '' : `<a class="btn ghost" href="#/sesion/manual">Registrar pasada</a>
+          <a class="btn" href="#/sesion/nueva">+ Nueva</a>`}
         </div>
       </div>
       ${liveBanner(sessions.find((s) => s.in_progress))}
@@ -644,7 +706,7 @@
   function sessionItem(s) {
     const d = parseIso(s.date);
     return `
-      <a class="session-item" href="#/${s.in_progress ? 'en-vivo' : 'sesion'}/${s.id}">
+      <a class="session-item" href="${L(`#/${s.in_progress ? 'en-vivo' : 'sesion'}/${s.id}`)}">
         <div class="date"><span>${d.toLocaleDateString('es', { weekday: 'short' })}</span><b>${d.getDate()}</b><span>${d.toLocaleDateString('es', { month: 'short' })}</span></div>
         <div style="min-width:0">
           <div class="title">${esc(s.title || 'Entrenamiento')}${s.in_progress ? ' <span class="chip live">En curso</span>' : ''}</div>
@@ -1330,6 +1392,94 @@
     });
   }
 
+  // ================= Vista: Detalle de sesión (solo lectura, para el administrador) =================
+  async function viewSessionDetail(id) {
+    const s = await api('GET', `/sessions/${id}`);
+    // Lo que hizo la vez anterior a esta sesión en cada ejercicio, para comparar serie a serie.
+    const prevs = await Promise.all(s.exercises.map((ex) =>
+      api('GET', `/exercises/${ex.exercise_id}/history?limit=1&before=${id}`).then((h) => h.history[0] || null).catch(() => null)
+    ));
+    const allSets = s.exercises.flatMap((ex) => ex.sets);
+    const { volume, reps } = setsSummary(allSets);
+    const cmpLabel = (set, prev) => {
+      const c = compareSet(set, prev);
+      if (c === 'new') return '';
+      return `<span class="cmp ${c}">${{ up: '↑', same: '=', down: '↓' }[c]} ${c === 'same' ? '' : setDelta(set, prev)}</span>`;
+    };
+    const longDate = fmtDate(s.date, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    const updated = new Date(s.updated_at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' });
+
+    view.innerHTML = `
+      <div class="page-head">
+        <div style="min-width:0">
+          <a href="${L('#/sesiones')}" class="muted small">‹ Sesiones</a>
+          <h1>${esc(s.title || 'Entrenamiento')}${s.in_progress ? ' <span class="chip live">En curso</span>' : ''}</h1>
+          <div class="muted small" style="margin-top:4px">${esc(longDate)}${s.in_progress
+            ? ` · empezó ${new Date(s.created_at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })} · actualizado ${updated}` : ''}</div>
+        </div>
+        ${s.in_progress ? '<button class="btn ghost small" id="refresh">Actualizar</button>' : ''}
+      </div>
+      <div class="stack">
+        <div class="kpis">
+          <div class="kpi"><div class="label">Duración</div><div class="value">${s.duration_min ? fmtMin(s.duration_min) : '—'}</div></div>
+          <div class="kpi"><div class="label">Esfuerzo</div><div class="value">${s.rpe ?? '—'}<small>${s.rpe ? ' RPE' : ''}</small></div></div>
+          <div class="kpi"><div class="label">Ejercicios</div><div class="value">${s.exercises.length}</div></div>
+          <div class="kpi"><div class="label">Series</div><div class="value">${allSets.length}</div><span class="delta">${fmtNum(reps)} reps</span></div>
+          <div class="kpi"><div class="label">Volumen</div><div class="value">${volume ? fmtKg(volume) : '—'}</div></div>
+          <div class="kpi"><div class="label">Peso corporal</div><div class="value">${s.bodyweight ? `${fmtNum(s.bodyweight, 2)}<small> kg</small>` : '—'}</div></div>
+        </div>
+        ${s.notes ? `<section class="card"><h2>Comentarios de la sesión</h2><p class="note">${esc(s.notes)}</p></section>` : ''}
+        <section>
+          <h2 style="margin:4px 2px 10px">Ejercicios</h2>
+          ${s.exercises.length ? s.exercises.map((ex, i) => {
+            const prev = prevs[i];
+            return `
+            <div class="ex-card">
+              <div class="ex-head">
+                <div class="name">
+                  <strong><a href="${L(`#/ejercicio/${ex.exercise_id}`)}">${i + 1}. ${esc(ex.name)}</a></strong>
+                  <div class="chips"><span class="chip main">${esc(muscleLabel(ex.muscle))}</span>${ex.secondary.map((m) => `<span class="chip">${esc(muscleLabel(m))}</span>`).join('')}</div>
+                </div>
+                ${beatLast(ex.sets, prev) ? '<span class="beat">🏆 Superó la vez anterior</span>' : ''}
+              </div>
+              <div class="ex-last">${prev
+                ? `Vez anterior (${fmtDate(prev.date)}): ${esc(fmtSets(prev.sets) || 'sin series')}`
+                : 'Primera vez que registra este ejercicio.'}</div>
+              ${ex.sets.length ? `<table class="sets read">
+                <thead><tr><th>#</th><th>Reps</th><th>Kg</th><th>RIR</th><th>vs. anterior</th></tr></thead>
+                <tbody>${ex.sets.map((set, j) => `<tr>
+                  <td>${j + 1}</td><td>${set.reps ?? '–'}</td><td>${set.weight ? fmtNum(set.weight, 2) : '–'}</td>
+                  <td>${set.rir ?? '–'}</td><td>${cmpLabel(set, prev && prev.sets[j])}</td></tr>`).join('')}
+                </tbody></table>` : '<p class="muted small">Sin series registradas.</p>'}
+              ${ex.rest_sec || ex.notes ? `<div class="ex-notes">
+                ${ex.rest_sec ? `<span class="muted small">Descanso ${ex.rest_sec} s</span>` : ''}
+                ${ex.notes ? `<p class="note">💬 ${esc(ex.notes)}</p>` : ''}
+              </div>` : ''}
+            </div>`;
+          }).join('') : `<p class="muted card">${s.in_progress ? 'Todavía no confirma ninguna serie.' : 'Esta sesión no tiene ejercicios.'}</p>`}
+        </section>
+      </div>`;
+
+    // Si está entrenando ahora, se actualiza sola cada 20 s (solo con la pestaña visible).
+    if (s.in_progress) {
+      const here = location.hash;
+      let handle;
+      const refresh = async () => {
+        if (location.hash !== here) return;
+        clearInterval(handle);
+        state.cleanup = null;
+        const y = window.scrollY;
+        try {
+          await viewSessionDetail(id);
+          window.scrollTo(0, y);
+        } catch (err) { toast(err.message, true); }
+      };
+      $('#refresh').addEventListener('click', refresh);
+      handle = setInterval(() => { if (!document.hidden) refresh(); }, 20000);
+      state.cleanup = () => clearInterval(handle);
+    }
+  }
+
   // ================= Vista: Ejercicios =================
   async function viewExercises() {
     await loadExercises();
@@ -1337,7 +1487,7 @@
     view.innerHTML = `
       <div class="page-head">
         <h1>Ejercicios</h1>
-        <button class="btn" id="new-ex">+ Nuevo</button>
+        ${ro() ? '' : '<button class="btn" id="new-ex">+ Nuevo</button>'}
       </div>
       <div class="row" style="margin-bottom:8px">
         <input id="ex-q" placeholder="Buscar…" style="flex:1;min-width:160px">
@@ -1352,7 +1502,7 @@
         const items = list.filter((e) => e.muscle === k);
         if (!items.length) return '';
         return `<h3 class="group-title">${esc(label)} · ${items.length}</h3><div class="ex-list">${items.map((e) => `
-          <a class="ex-row ${e.archived ? 'archived' : ''}" href="#/ejercicio/${e.id}">
+          <a class="ex-row ${e.archived ? 'archived' : ''}" href="${L(`#/ejercicio/${e.id}`)}">
             <span class="name">${esc(e.name)}${e.secondary.length ? `<br><span class="muted small">+ ${esc(e.secondary.map(muscleLabel).join(', '))}</span>` : ''}</span>
             <span class="muted small">${e.uses ? `${e.uses} ${e.uses === 1 ? 'vez' : 'veces'}` : ''}${e.archived ? ' · archivado' : ''}</span>
           </a>`).join('')}</div>`;
@@ -1361,7 +1511,7 @@
     draw();
     $('#ex-q').addEventListener('input', draw);
     $('#ex-arch').addEventListener('change', (e) => { showArchived = e.target.checked; draw(); });
-    $('#new-ex').addEventListener('click', () => editExercise(null, draw));
+    $('#new-ex')?.addEventListener('click', () => editExercise(null, draw));
   }
 
   async function viewExercise(exId) {
@@ -1371,14 +1521,14 @@
     view.innerHTML = `
       <div class="page-head">
         <div>
-          <a href="#/ejercicios" class="muted small">‹ Ejercicios</a>
+          <a href="${L('#/ejercicios')}" class="muted small">‹ Ejercicios</a>
           <h1>${esc(ex.name)}</h1>
           <div class="chips" style="margin-top:6px"><span class="chip main">${esc(muscleLabel(ex.muscle))}</span>${ex.secondary.map((m) => `<span class="chip">${esc(muscleLabel(m))}</span>`).join('')}</div>
         </div>
-        <div class="row">
+        ${ro() ? '' : `<div class="row">
           <button class="btn ghost small" id="edit">Editar</button>
           <button class="btn ghost small" id="archive">${ex.archived ? 'Restaurar' : hist.length ? 'Archivar' : 'Eliminar'}</button>
-        </div>
+        </div>`}
       </div>
       <div class="stack">
         <div class="kpis">
@@ -1393,15 +1543,15 @@
           ${hist.length ? `<div class="table-wrap"><table class="list">
             <thead><tr><th>Fecha</th><th>Series</th><th class="n">Volumen</th></tr></thead>
             <tbody>${hist.map((x) => `<tr>
-              <td><a href="#/sesion/${x.session_id}">${fmtDate(x.date, { day: 'numeric', month: 'short', year: '2-digit' })}</a>${x.title ? `<br><span class="muted small">${esc(x.title)}</span>` : ''}</td>
+              <td><a href="${L(`#/sesion/${x.session_id}`)}">${fmtDate(x.date, { day: 'numeric', month: 'short', year: '2-digit' })}</a>${x.title ? `<br><span class="muted small">${esc(x.title)}</span>` : ''}</td>
               <td>${esc(fmtSets(x.sets)) || '—'}${x.rest_sec ? `<br><span class="muted small">descanso ${x.rest_sec}s</span>` : ''}${x.notes ? `<br><span class="muted small">${esc(x.notes)}</span>` : ''}</td>
               <td class="n">${x.volume ? fmtKg(x.volume) : '—'}</td></tr>`).join('')}</tbody></table></div>`
-            : '<p class="muted">Aún no has registrado este ejercicio.</p>'}
+            : `<p class="muted">${ro() ? 'Aún no registra' : 'Aún no has registrado'} este ejercicio.</p>`}
         </section>
       </div>`;
 
-    $('#edit').addEventListener('click', () => editExercise(ex, () => route()));
-    $('#archive').addEventListener('click', async () => {
+    $('#edit')?.addEventListener('click', () => editExercise(ex, () => route()));
+    $('#archive')?.addEventListener('click', async () => {
       if (ex.archived) {
         await api('PATCH', `/exercises/${ex.id}`, { archived: false });
         toast('Ejercicio restaurado');
@@ -1590,7 +1740,8 @@
         <h1>Usuarios</h1>
         <button class="btn" id="new-user">+ Nuevo usuario</button>
       </div>
-      <p class="hint">No abras sus enlaces en este navegador: la app recordaría el de ellos en vez del tuyo.
+      <p class="hint">Con <strong>Ver entrenamientos</strong> revisas sus sesiones, series y comentarios sin poder modificarlos.
+        No abras sus enlaces en este navegador: la app recordaría el de ellos en vez del tuyo.
         Usa <strong>Copiar</strong> o <strong>Compartir</strong> para enviárselos.</p>
       <div class="user-list">
         ${users.map((u) => `
@@ -1605,6 +1756,7 @@
               <div class="muted small">${activity(u)}</div>
             </div>
             <div class="user-actions">
+              ${u.token === token ? '' : `<a class="btn small" href="#/u/${u.id}/resumen">Ver entrenamientos</a>`}
               <button class="btn ghost small" data-act="copy">Copiar enlace</button>
               <button class="btn ghost small" data-act="share">Compartir</button>
               <details class="menu">

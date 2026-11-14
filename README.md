@@ -116,6 +116,11 @@ En tu app, **Ajustes → Usuarios**:
 
 - **+ Nuevo usuario**: escribe su nombre y obtienes su enlace. Envíaselo con **Copiar** o
   **Compartir** (WhatsApp, correo…). Su espacio parte vacío, con el catálogo de ejercicios.
+- **Ver entrenamientos**: revisas los datos de esa persona en **solo lectura**: su resumen,
+  sus sesiones (series con reps, kg y RIR, descansos, comentarios de la sesión y de cada
+  ejercicio, comparación serie a serie con la vez anterior) y el historial de cada ejercicio.
+  Si está entrenando en ese momento, la sesión en curso se actualiza sola cada 20 s.
+  Una franja arriba indica a quién estás viendo; **Salir** te devuelve a tus datos.
 - En cada usuario ves su actividad (sesiones totales, de esta semana y la última) y en
   el menú **⋯** puedes:
   - **Generar enlace nuevo**: si lo perdió o se filtró. El anterior deja de funcionar.
