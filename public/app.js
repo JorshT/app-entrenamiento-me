@@ -112,11 +112,45 @@
         rest_sec: numOrNull(ex.rest_sec),
         notes: ex.notes,
         sets: ex.sets
-          .map((s) => ({ reps: numOrNull(s.reps), weight: numOrNull(s.weight), rir: numOrNull(s.rir) }))
+          .map((s) => ({ reps: numOrNull(s.reps), weight: numOrNull(s.weight), rir: numOrNull(s.rir), done_at: s.done_at || null }))
           .filter((s) => s.reps !== null || s.weight !== null),
       })),
     };
   }
+
+  // ---------- Sesiones en vivo olvidadas ----------
+  // Tras esta inactividad (sin confirmar series) la app pregunta si olvidaste terminar.
+  // A las 24 h el servidor la cierra solo (ver AUTO_CLOSE_HOURS en src/app.js).
+  const STALE_MIN = 60;
+
+  // Última actividad: la última serie confirmada; en sesiones sin hora por serie, el último guardado.
+  // Misma regla que lastActivity() en src/app.js.
+  function lastActivity(s) {
+    const start = new Date(s.created_at).getTime();
+    let last = 0;
+    for (const ex of s.exercises) for (const st of ex.sets) last = Math.max(last, new Date(st.done_at || 0).getTime());
+    return last ? Math.max(last, start) : Math.max(start, new Date(s.updated_at || s.created_at).getTime());
+  }
+  const isStale = (s) => Date.now() - lastActivity(s) >= STALE_MIN * 60000;
+
+  // "hoy a las 19:42" / "ayer a las 19:42" / "lun 17 nov a las 19:42"
+  function fmtWhen(ts) {
+    const d = new Date(ts);
+    const days = diffDays(toIso(d), todayIso());
+    const day = days === 0 ? 'hoy' : days === 1 ? 'ayer' : d.toLocaleDateString('es', { weekday: 'short', day: 'numeric', month: 'short' });
+    return `${day} a las ${d.toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}`;
+  }
+  function fmtAgo(ms) {
+    const min = Math.round(ms / 60000);
+    if (min < 60) return `hace ${min} min`;
+    const h = Math.round(min / 60);
+    return h < 48 ? `hace ${h} h` : `hace ${Math.round(h / 24)} días`;
+  }
+
+  // Si elegiste "Seguir entrenando", no se vuelve a preguntar hasta que haya actividad nueva.
+  const staleKey = () => `entrenos:stale-ok:${token}`;
+  const staleDismissed = (id, last) => store.get(staleKey()) === `${id}:${last}`;
+  const dismissStale = (id, last) => store.set(staleKey(), `${id}:${last}`);
 
   const liveBanner = (s) => (s ? `
     <a class="live-banner" href="${L(`#/en-vivo/${s.id}`)}">
@@ -338,6 +372,7 @@
     state.charts.forEach((c) => c.destroy());
     state.charts = [];
     state.onOnline = null;
+    state.onStale = null;
 
     // #/u/<id>/… = el administrador viendo los entrenamientos de otro usuario.
     const fullHash = location.hash || '#/resumen';
@@ -367,6 +402,25 @@
     }
   }
   window.addEventListener('hashchange', route);
+
+  // Al abrir la app (o volver a ella desde otra), si quedó un entrenamiento abierto sin actividad
+  // se abre para preguntarte si lo terminas. No interrumpe si estás editando algo.
+  let staleCheckedAt = 0;
+  async function checkStale() {
+    if (ro() || state.dirty || modal.open || Date.now() - staleCheckedAt < 60000) return;
+    staleCheckedAt = Date.now();
+    const active = await api('GET', '/sessions/active').catch(() => null);
+    if (!active) return;
+    let s = active;
+    try {
+      const local = JSON.parse(store.get(liveKey(active.id)) || 'null'); // cambios aún sin subir
+      if (local && local.pending && local.draft) s = local.draft;
+    } catch { /* copia local corrupta */ }
+    if (!isStale(s) || staleDismissed(active.id, lastActivity(s))) return;
+    if (location.hash === `#/en-vivo/${active.id}`) { if (state.onStale) state.onStale(); return; }
+    location.hash = `#/en-vivo/${active.id}`; // la vista en vivo hace la pregunta al abrirse
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && state.me) checkStale(); });
   window.addEventListener('online', () => state.onOnline && state.onOnline());
   window.addEventListener('beforeunload', (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ''; } });
 
@@ -709,7 +763,7 @@
       <a class="session-item" href="${L(`#/${s.in_progress ? 'en-vivo' : 'sesion'}/${s.id}`)}">
         <div class="date"><span>${d.toLocaleDateString('es', { weekday: 'short' })}</span><b>${d.getDate()}</b><span>${d.toLocaleDateString('es', { month: 'short' })}</span></div>
         <div style="min-width:0">
-          <div class="title">${esc(s.title || 'Entrenamiento')}${s.in_progress ? ' <span class="chip live">En curso</span>' : ''}</div>
+          <div class="title">${esc(s.title || 'Entrenamiento')}${s.in_progress ? ' <span class="chip live">En curso</span>' : ''}${s.auto_closed ? ' <span class="chip warn" title="Quedó abierta y la app la cerró sola">Cerrada sola</span>' : ''}</div>
           <div class="chips">${s.muscles.map((m) => `<span class="chip">${esc(muscleLabel(m))}</span>`).join('')}</div>
           ${s.notes ? `<div class="muted small" style="margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(s.notes)}</div>` : ''}
         </div>
@@ -750,7 +804,7 @@
     }
     draft.exercises = draft.exercises.map((e) => ({
       exercise_id: e.exercise_id, rest_sec: e.rest_sec, notes: e.notes || '',
-      sets: e.sets.map((s) => ({ reps: s.reps, weight: s.weight, rir: s.rir })),
+      sets: e.sets.map((s) => ({ reps: s.reps, weight: s.weight, rir: s.rir, done_at: s.done_at })),
     }));
     state.dirty = !!copyFrom;
 
@@ -768,6 +822,7 @@
         </div>
       </div>
       ${restored ? '<p class="hint">Se recuperó un borrador sin guardar.</p><br>' : ''}
+      ${draft.auto_closed ? '<p class="hint warn">Este entrenamiento quedó abierto y la app lo cerró sola, con la duración hasta tu última serie. Revísala y agrega el esfuerzo si quieres; al guardar deja de marcarse.</p><br>' : ''}
       <form id="editor" autocomplete="off">
         <section class="card">
           <div class="fields">
@@ -990,7 +1045,7 @@
     draft.in_progress = true;
     draft.exercises = draft.exercises.map((e) => ({
       exercise_id: e.exercise_id, rest_sec: e.rest_sec, notes: e.notes || '',
-      sets: e.sets.map((s) => ({ reps: s.reps, weight: s.weight, rir: s.rir })),
+      sets: e.sets.map((s) => ({ reps: s.reps, weight: s.weight, rir: s.rir, done_at: s.done_at })),
     }));
 
     // Última vez de cada ejercicio (objetivo a superar).
@@ -1180,7 +1235,7 @@
         }
         case 'done': {
           const v = nextOf(ex);
-          const set = { reps: numOrNull(v.reps), weight: numOrNull(v.weight), rir: numOrNull(v.rir) };
+          const set = { reps: numOrNull(v.reps), weight: numOrNull(v.weight), rir: numOrNull(v.rir), done_at: new Date().toISOString() };
           if (set.reps === null && set.weight === null) { toast('Anota las reps o los kilos', true); return; }
           const prev = last?.sets[ex.sets.length];
           const wasBeaten = beatLast(ex.sets, last);
@@ -1221,16 +1276,24 @@
       list.lastElementChild?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }));
 
-    $('#finish').addEventListener('click', () => {
+    // Terminar. Si llevas rato sin anotar nada (olvidaste terminar), la duración se calcula hasta tu
+    // última serie y no hasta ahora, y el formulario lo explica.
+    const openFinish = () => {
       const withSets = draft.exercises.filter((ex) => ex.sets.length);
       const compared = withSets.filter((ex) => lasts.get(ex.exercise_id)?.sets.length);
       const beaten = compared.filter((ex) => beatLast(ex.sets, lasts.get(ex.exercise_id)));
-      const minutes = Math.max(1, Math.round((Date.now() - started) / 60000));
+      const last = lastActivity(draft);
+      const stale = isStale(draft);
+      const minutes = Math.max(1, Math.round(((stale ? last : Date.now()) - started) / 60000));
       const nSets = withSets.reduce((a, ex) => a + ex.sets.length, 0);
+      let finished = false;
       const m = openModal(`
         <form method="dialog" id="finish-form" autocomplete="off">
-          <div class="modal-head"><h2>Terminar entrenamiento</h2><button type="button" class="btn ghost icon" data-close aria-label="Cerrar">✕</button></div>
+          <div class="modal-head"><h2>${stale ? '¿Olvidaste terminar?' : 'Terminar entrenamiento'}</h2><button type="button" class="btn ghost icon" data-close aria-label="Cerrar">✕</button></div>
           <div class="modal-body">
+            ${stale ? `<p class="hint">Este entrenamiento sigue abierto. ${withSets.length ? 'Tu última serie fue' : 'Lo empezaste'}
+              <strong>${esc(fmtWhen(last))}</strong> (${esc(fmtAgo(Date.now() - last))}).
+              ${withSets.length ? 'La duración se calculó hasta esa serie.' : ''}</p>` : ''}
             <p style="margin:0">${withSets.length} ejercicio${withSets.length === 1 ? '' : 's'} · ${nSets} serie${nSets === 1 ? '' : 's'}${compared.length ? `<br>🏆 Superaste la vez anterior en <strong>${beaten.length} de ${compared.length}</strong> ejercicio${compared.length === 1 ? '' : 's'}` : ''}</p>
             ${withSets.length ? '' : '<p class="hint warn">No anotaste ninguna serie. Puedes descartar este entrenamiento.</p>'}
             <div class="fields">
@@ -1244,16 +1307,19 @@
             <button type="button" class="btn danger" id="discard-live">Descartar</button>
             <span class="spacer"></span>
             <button type="button" class="btn ghost" data-close>Seguir</button>
-            <button type="submit" class="btn">Guardar</button>
+            <button type="submit" class="btn">${stale ? 'Terminar' : 'Guardar'}</button>
           </div>
         </form>`);
+      // Cerrar sin terminar = sigues entrenando: no se vuelve a preguntar hasta que anotes algo.
+      if (stale) m.addEventListener('close', () => { if (!finished) dismissStale(id, last); }, { once: true });
       $('#discard-live', m).addEventListener('click', async () => {
         if (!confirm('¿Descartar este entrenamiento? Se borran todas sus series.')) return;
+        finished = true;
         await stopSaving();
         try {
           await api('DELETE', `/sessions/${id}`);
         } catch (err) {
-          if (err.status !== 404) { saver.closed = false; toast(err.message, true); return; }
+          if (err.status !== 404) { saver.closed = false; finished = false; toast(err.message, true); return; }
         }
         store.del(liveKey(id));
         m.close();
@@ -1265,6 +1331,7 @@
         const fd = new FormData(e.target);
         const btn = e.target.querySelector('[type=submit]');
         btn.disabled = true;
+        finished = true;
         await stopSaving(); // que un guardado pendiente no vuelva a marcarla "en curso"
         const final = { ...draft, in_progress: false, duration_min: fd.get('duration_min'), rpe: fd.get('rpe'), bodyweight: fd.get('bodyweight'), notes: fd.get('notes') };
         try {
@@ -1276,11 +1343,20 @@
           location.hash = '#/sesiones';
         } catch (err) {
           saver.closed = false;
+          finished = false;
           toast(err.status ? err.message : 'Sin conexión. Inténtalo de nuevo.', true);
           btn.disabled = false;
         }
       });
-    });
+    };
+    $('#finish').addEventListener('click', openFinish);
+
+    // Al abrir (o volver a) un entrenamiento que quedó abierto sin actividad, se pregunta si terminarlo.
+    const promptIfStale = () => {
+      if (!modal.open && isStale(draft) && !staleDismissed(id, lastActivity(draft))) openFinish();
+    };
+    state.onStale = promptIfStale;
+    promptIfStale();
   }
 
   // Editar o borrar una serie ya anotada en vivo.
@@ -1313,7 +1389,7 @@
       const fd = new FormData(e.target);
       const set = { reps: numOrNull(fd.get('reps')), weight: numOrNull(fd.get('weight')), rir: numOrNull(fd.get('rir')) };
       if (set.reps === null && set.weight === null) { toast('Anota las reps o los kilos', true); return; }
-      ex.sets[j] = set;
+      ex.sets[j] = { ...set, done_at: s.done_at };
       m.close();
       onDone();
     });
@@ -1866,6 +1942,7 @@
       return;
     }
     $('#nav').hidden = false;
-    route();
+    await route();
+    checkStale();
   })();
 })();

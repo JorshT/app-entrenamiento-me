@@ -30,6 +30,13 @@ function optNum(v, min, max, field) {
   return Math.round(n * 100) / 100;
 }
 
+// Fecha y hora (ISO) opcional; si no se entiende se ignora (no vale la pena rechazar la sesión por eso).
+function optTime(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const t = typeof v === 'number' ? v : Date.parse(v);
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
 function str(v, max, field) {
   if (v === null || v === undefined) return '';
   if (typeof v !== 'string') throw new HttpError(400, `Valor inválido en "${field}"`);
@@ -74,6 +81,7 @@ function parseSession(body, validExerciseIds) {
           reps: optInt(s && s.reps, 0, 10000, 'reps'),
           weight: optNum(s && s.weight, 0, 2000, 'weight'),
           rir: optInt(s && s.rir, 0, 10, 'rir'),
+          done_at: optTime(s && s.done_at),
         })),
       };
     }),
@@ -105,7 +113,7 @@ async function getSession(q, spaceId, id) {
     [id]
   );
   const sets = await q.query(
-    `SELECT st.session_exercise_id, st.reps, st.weight, st.rir
+    `SELECT st.session_exercise_id, st.reps, st.weight, st.rir, st.done_at
        FROM sets st JOIN session_exercises se ON se.id = st.session_exercise_id
       WHERE se.session_id = $1 ORDER BY st.position`,
     [id]
@@ -117,7 +125,9 @@ async function getSession(q, spaceId, id) {
     secondary: splitList(ex.secondary),
     rest_sec: ex.rest_sec,
     notes: ex.notes,
-    sets: sets.filter((st) => st.session_exercise_id === ex.id).map(({ session_exercise_id, ...st }) => st),
+    sets: sets
+      .filter((st) => st.session_exercise_id === ex.id)
+      .map(({ session_exercise_id, done_at, ...st }) => (done_at ? { ...st, done_at } : st)),
   }));
   return s;
 }
@@ -139,14 +149,59 @@ async function writeSessionChildren(q, sessionId, exercises) {
     ]
   );
   const idByPos = new Map(seIds.map((r) => [r.position, r.id]));
-  const rows = exercises.flatMap((e, i) => e.sets.map((s, j) => [idByPos.get(i), j, s.reps, s.weight, s.rir]));
+  const rows = exercises.flatMap((e, i) => e.sets.map((s, j) => [idByPos.get(i), j, s.reps, s.weight, s.rir, s.done_at]));
   if (!rows.length) return;
   await q.query(
-    `INSERT INTO sets (session_exercise_id, position, reps, weight, rir)
-     SELECT * FROM unnest($1::int[], $2::int[], $3::int[], $4::float8[], $5::int[])`,
-    [0, 1, 2, 3, 4].map((k) => rows.map((r) => r[k]))
+    `INSERT INTO sets (session_exercise_id, position, reps, weight, rir, done_at)
+     SELECT * FROM unnest($1::int[], $2::int[], $3::int[], $4::float8[], $5::int[], $6::timestamptz[])`,
+    [0, 1, 2, 3, 4, 5].map((k) => rows.map((r) => r[k]))
   );
 }
+
+// ---------- Sesiones olvidadas ----------
+// Si nadie termina una sesión en vivo, la app la cierra sola pasado este tiempo sin actividad
+// (antes, al volver a abrirla, la app pregunta si quieres terminarla).
+const AUTO_CLOSE_HOURS = 24;
+
+// Última actividad de una sesión: la última serie confirmada (o, en sesiones anteriores a que se
+// guardara la hora de cada serie, el último guardado). Misma regla que en public/app.js.
+function lastActivity(s) {
+  const start = new Date(s.created_at).getTime();
+  let last = 0;
+  for (const ex of s.exercises) for (const st of ex.sets) last = Math.max(last, new Date(st.done_at || 0).getTime());
+  return last ? Math.max(last, start) : Math.max(start, new Date(s.updated_at).getTime());
+}
+
+// Cierra las sesiones en vivo sin actividad hace más de AUTO_CLOSE_HOURS, con la duración calculada
+// hasta la última serie. Las que no tienen ninguna serie se borran. spaceId null = todos los usuarios.
+async function closeStaleSessions(db, spaceId = null) {
+  const candidates = await db.query(
+    `SELECT id, space_id FROM sessions
+      WHERE in_progress AND ($1::int IS NULL OR space_id = $1) AND updated_at < now() - $2::int * interval '1 hour'`,
+    [spaceId, AUTO_CLOSE_HOURS]
+  );
+  let closed = 0;
+  for (const c of candidates) {
+    const s = await getSession(db, c.space_id, c.id);
+    const last = lastActivity(s);
+    if (Date.now() - last < AUTO_CLOSE_HOURS * 3600000) continue;
+    if (!s.exercises.some((ex) => ex.sets.length)) {
+      await db.query('DELETE FROM sessions WHERE id = $1 AND in_progress', [s.id]);
+    } else {
+      const minutes = Math.min(1440, Math.max(1, Math.round((last - new Date(s.created_at).getTime()) / 60000)));
+      await db.query(
+        `UPDATE sessions SET in_progress = false, auto_closed = true, duration_min = COALESCE(duration_min, $2),
+                updated_at = now() WHERE id = $1 AND in_progress`,
+        [s.id, minutes]
+      );
+    }
+    closed += 1;
+  }
+  return closed;
+}
+
+// Que un problema al cerrar sesiones olvidadas no impida usar la app.
+const closeStaleQuietly = (db, spaceId) => closeStaleSessions(db, spaceId).catch((e) => console.error(e));
 
 async function exerciseIds(q, spaceId) {
   const rows = await q.query('SELECT id FROM exercises WHERE space_id = $1', [spaceId]);
@@ -186,6 +241,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
   api.get('/health', async (req, res) => {
     const db = await getDb();
     await db.query('SELECT 1');
+    await closeStaleQuietly(db, null);
     res.set('Cache-Control', 'no-store').json({ ok: true });
   });
 
@@ -200,7 +256,9 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     next();
   });
 
-  api.get('/s/:token/me', (req, res) => {
+  // La app lo pide al abrirse: buen momento para cerrar las sesiones que quedaron olvidadas.
+  api.get('/s/:token/me', async (req, res) => {
+    await closeStaleQuietly(req.db, req.space.id);
     const { id, token, ...rest } = req.space;
     res.json({ ...rest, muscles: MUSCLES });
   });
@@ -238,6 +296,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
 
   api.get('/s/:token/admin/users', async (req, res) => {
     const today = D.isIsoDate(req.query.today) ? req.query.today : D.todayIso();
+    await closeStaleQuietly(req.db, null); // que "Entrenando" no quede pegado en alguien que olvidó terminar
     res.json(
       await req.db.query(
         `SELECT sp.id, sp.name, sp.token, sp.is_admin, sp.disabled, sp.created_at,
@@ -420,7 +479,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     const to = D.isIsoDate(req.query.to) ? req.query.to : '9999-12-31';
     const limit = optInt(req.query.limit, 1, 1000, 'limit') || 200;
     const sessions = await req.db.query(
-      `SELECT s.id, s.date, s.title, s.duration_min, s.rpe, s.notes, s.in_progress,
+      `SELECT s.id, s.date, s.title, s.duration_min, s.rpe, s.notes, s.in_progress, s.auto_closed,
               (SELECT COUNT(*)::int FROM session_exercises se WHERE se.session_id = s.id) AS exercise_count,
               (SELECT COUNT(*)::int FROM sets st JOIN session_exercises se ON se.id = st.session_exercise_id
                 WHERE se.session_id = s.id) AS set_count,
@@ -467,7 +526,7 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
     await req.db.tx(async (q) => {
       await q.query(
         `UPDATE sessions SET date = $1, title = $2, duration_min = $3, rpe = $4, bodyweight = $5, notes = $6,
-                in_progress = $7, updated_at = now() WHERE id = $8`,
+                in_progress = $7, auto_closed = false, updated_at = now() WHERE id = $8`,
         [data.date, data.title, data.duration_min, data.rpe, data.bodyweight, data.notes, data.in_progress, id]
       );
       await writeSessionChildren(q, id, data.exercises);
@@ -584,4 +643,4 @@ function createApp(dbOrGetter, { serveStatic = true } = {}) {
   return app;
 }
 
-module.exports = { createApp };
+module.exports = { createApp, closeStaleSessions, AUTO_CLOSE_HOURS };

@@ -150,6 +150,61 @@ test('sesión en vivo: se crea vacía, se autoguarda y se termina', async (t) =>
   assert.equal((await api('GET', '/sessions/active')).body, null);
 });
 
+test('sesión olvidada: guarda la hora de cada serie y se cierra sola a las 24 h', async (t) => {
+  const { api, db } = await setup(t);
+  const bench = (await api('GET', '/exercises')).body.find((e) => e.name === 'Press banca');
+  const ago = (h) => new Date(Date.now() - h * 3600000).toISOString();
+
+  // Empezó hace 30 h y la última serie fue 29 h atrás (≈ 60 min de entrenamiento).
+  const s = (await api('POST', '/sessions', { date: '2026-09-30', in_progress: true, exercises: [] })).body;
+  const lastSet = ago(29);
+  const saved = (await api('PUT', `/sessions/${s.id}`, {
+    ...s,
+    exercises: [{ exercise_id: bench.id, sets: [{ reps: 8, weight: 60, done_at: ago(29.5) }, { reps: 8, weight: 60, done_at: lastSet }, { reps: 5, done_at: 'no es fecha' }] }],
+  })).body;
+  assert.equal(saved.exercises[0].sets[1].done_at, lastSet);
+  assert.equal(saved.exercises[0].sets[2].done_at, undefined, 'una hora inválida se ignora');
+  // Otra olvidada, sin series: se borra en vez de cerrarse.
+  const empty = (await api('POST', '/sessions', { date: '2026-09-30', in_progress: true, exercises: [] })).body;
+  // Una reciente no se toca.
+  const fresh = (await api('POST', '/sessions', { date: '2026-09-30', in_progress: true, exercises: [] })).body;
+
+  await db.query(`UPDATE sessions SET created_at = $1, updated_at = $2 WHERE id = $3`, [new Date(Date.parse(lastSet) - 3600000).toISOString(), lastSet, s.id]);
+  await db.query(`UPDATE sessions SET created_at = $1, updated_at = $1 WHERE id = $2`, [ago(26), empty.id]);
+
+  await api('GET', '/me'); // al abrir la app se cierran las olvidadas
+  const closed = (await api('GET', `/sessions/${s.id}`)).body;
+  assert.equal(closed.in_progress, false);
+  assert.equal(closed.auto_closed, true);
+  assert.equal(closed.duration_min, 60);
+  assert.equal((await api('GET', `/sessions/${empty.id}`)).status, 404);
+  assert.equal((await api('GET', `/sessions/${fresh.id}`)).body.in_progress, true);
+  assert.equal((await api('GET', '/sessions')).body.find((x) => x.id === s.id).auto_closed, true);
+
+  // Al revisarla y guardarla deja de marcarse como cerrada sola, y conserva la hora de las series.
+  const reviewed = (await api('PUT', `/sessions/${s.id}`, { ...closed, rpe: 8 })).body;
+  assert.equal(reviewed.auto_closed, false);
+  assert.equal(reviewed.duration_min, 60);
+  assert.ok(reviewed.exercises[0].sets[0].done_at);
+});
+
+test('el cron diario cierra las sesiones olvidadas de todos los usuarios', async (t) => {
+  const { api, db, base } = await setup(t);
+  const ana = (await api('POST', '/admin/users', { name: 'Ana' })).body;
+  const ex = (await api('GET', '/exercises', null, ana.token)).body[0];
+  const s = (await api('POST', '/sessions', {
+    date: '2026-09-30', in_progress: true,
+    exercises: [{ exercise_id: ex.id, sets: [{ reps: 5, weight: 20 }] }], // sin hora: sesión de antes del cambio
+  }, ana.token)).body;
+  const ago = (h) => new Date(Date.now() - h * 3600000).toISOString();
+  await db.query(`UPDATE sessions SET created_at = $1, updated_at = $2 WHERE id = $3`, [ago(48), ago(47), s.id]);
+
+  assert.equal((await fetch(`${base}/api/health`)).status, 200);
+  const closed = (await api('GET', `/sessions/${s.id}`, null, ana.token)).body;
+  assert.equal(closed.in_progress, false);
+  assert.equal(closed.duration_min, 60, 'sin hora por serie se usa el último guardado');
+});
+
 test('administración de usuarios: crear, enlace nuevo, suspender y eliminar', async (t) => {
   const { api, db } = await setup(t);
   const me = (await api('GET', '/me')).body;

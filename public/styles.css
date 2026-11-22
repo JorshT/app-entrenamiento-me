@@ -309,6 +309,7 @@ table.list a { text-decoration: none; }
 .user-name { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 2px; }
 .user-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+.session-item .title .chip.warn { vertical-align: 1px; }
 .user-name .chip.live { margin-left: 0; }
 
 .menu { position: relative; }
