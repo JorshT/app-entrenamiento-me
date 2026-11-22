@@ -309,6 +309,7 @@ table.list a { text-decoration: none; }
 .user-name { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 2px; }
 .user-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+.session-item .title .chip.warn { vertical-align: 1px; }
 .user-name .chip.live { margin-left: 0; }
 
 .menu { position: relative; }
@@ -388,3 +389,7 @@ body.viewing-as .nav { grid-template-columns: repeat(4, 1fr); }
 .note { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ex-head .name a { color: inherit; text-decoration: none; }
 .ex-head .beat { white-space: nowrap; }
+
+/* Dedicatoria de la página principal */
+.dedication { text-align: center; margin: 0 0 14px; font-size: .9rem; font-weight: 600; color: var(--muted); letter-spacing: .01em; }
+.stack + .dedication { margin: 24px 0 4px; }

@@ -14,6 +14,9 @@ con un **enlace único que contiene un token** (`https://tu-dominio/t/<token>`).
   - Se **guarda sola** en el servidor (si no hay conexión, se guarda en el celular y se sube
     después). Puedes continuarla desde otro dispositivo.
   - Al **Terminar** anotas duración (sugerida), RPE, peso corporal y comentarios.
+  - **Si olvidas terminar**: tras 1 h sin anotar series, al volver a abrir la app te pregunta
+    si lo terminas, con la duración calculada hasta tu última serie (no hasta ahora). Si no
+    respondes, a las 24 h se cierra solo y queda marcado como *Cerrada sola* para que lo revises.
 - **Registrar sesiones**: fecha, nombre/enfoque, duración, esfuerzo (RPE 1‑10),
   peso corporal y comentarios.
 - **Ejercicios de cada sesión**: series con repeticiones, kilos y RIR (opcional),
