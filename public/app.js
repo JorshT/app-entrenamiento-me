@@ -152,6 +152,9 @@
   const staleDismissed = (id, last) => store.get(staleKey()) === `${id}:${last}`;
   const dismissStale = (id, last) => store.set(staleKey(), `${id}:${last}`);
 
+  // Dedicatoria que se muestra arriba y abajo de la página principal (Resumen).
+  const APP_DEDICATION = '<p class="dedication">App de Daniela 🌹 y Jorsh</p>';
+
   const liveBanner = (s) => (s ? `
     <a class="live-banner" href="${L(`#/en-vivo/${s.id}`)}">
       <span><i class="dot"></i>${ro() ? 'Entrenando ahora' : 'Entrenamiento en curso'}${s.title ? ` · ${esc(s.title)}` : ''}</span>
@@ -445,6 +448,7 @@
     const perWeekLabel = s.period === 'week' ? 'esta semana' : `promedio semanal (${fmtNum(s.weeks, 1)} sem.)`;
 
     view.innerHTML = `
+      ${APP_DEDICATION}
       ${liveBanner(active)}
       <div class="period-bar">
         <div class="segmented" role="tablist">
@@ -514,7 +518,8 @@
           <h2>Peso corporal</h2>
           <div class="chart-box"><canvas id="chart-bw"></canvas></div>
         </section>
-      </div>`;
+      </div>
+      ${APP_DEDICATION}`;
 
     $$('[data-period]').forEach((b) => b.addEventListener('click', () => {
       state.period = b.dataset.period;
